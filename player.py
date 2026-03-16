@@ -18,6 +18,7 @@ from typing import Any
 
 import xbmc
 import xbmcaddon
+import xbmcgui
 
 _ADDON_ID = "script.punchplay"
 _VERSION = "1.0.0"
@@ -55,7 +56,22 @@ class PunchPlayPlayer(xbmc.Player):
             "scrobble_movies": addon.getSettingBool("scrobble_movies"),
             "scrobble_tv": addon.getSettingBool("scrobble_tv"),
             "scrobble_anime": addon.getSettingBool("scrobble_anime"),
+            "show_notifications": addon.getSettingBool("show_notifications"),
+            "notify_during_playback": addon.getSettingBool("notify_during_playback"),
         }
+
+    def _notify(self, message: str, settings: dict[str, Any]) -> None:
+        """Show a Kodi notification, respecting the user's notification settings."""
+        if not settings["show_notifications"]:
+            return
+        if not settings["notify_during_playback"] and self.isPlayingVideo():
+            return
+        xbmcgui.Dialog().notification(
+            "PunchPlay",
+            message,
+            xbmcgui.NOTIFICATION_INFO,
+            4000,
+        )
 
     def _should_track(
         self,
@@ -281,7 +297,8 @@ class PunchPlayPlayer(xbmc.Player):
                 position = self._last_position
                 duration = self._last_duration
             payload = self._build_payload(self._metadata, position, duration)
-            if duration > 0 and payload["progress"] >= settings["watched_threshold"]:
+            watched = duration > 0 and payload["progress"] >= settings["watched_threshold"]
+            if watched:
                 payload["watched"] = True
                 xbmc.log(
                     f"[PunchPlay] Watched threshold met "
@@ -294,6 +311,16 @@ class PunchPlayPlayer(xbmc.Player):
                 xbmc.LOGINFO,
             )
             self._api.post("/api/scrobble/stop", payload)
+            if watched:
+                title = self._metadata.get("title", "Unknown")
+                media_type = self._metadata.get("media_type", "movie")
+                if media_type == "episode":
+                    season = self._metadata.get("season")
+                    episode = self._metadata.get("episode")
+                    msg = f"✓ {title} S{season:02d}E{episode:02d} scrobbled"
+                else:
+                    msg = f"✓ {title} scrobbled"
+                self._notify(msg, settings)
         except Exception as exc:
             xbmc.log(f"[PunchPlay] Stop emit error: {exc}", xbmc.LOGDEBUG)
 
