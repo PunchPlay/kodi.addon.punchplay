@@ -3,9 +3,8 @@ identifier.py — Media identification pipeline.
 
 Priority order:
   1. Kodi library metadata via xbmc.InfoTagVideo (best quality).
-  2. guessit filename parsing (bundled in lib/).
-  3. Regex fallback parser (no external deps).
-  4. Raw filename sent as-is so the server can attempt its own lookup.
+  2. Regex filename parser (scene release tags, SxxExx, year extraction).
+  3. Raw filename sent as-is so the server can attempt its own lookup.
 
 Results are cached in SQLite to avoid re-parsing on every play event.
 """
@@ -18,15 +17,6 @@ import xbmc
 
 if TYPE_CHECKING:
     from cache import Cache
-
-# Try to import guessit from the bundled lib/ directory.
-try:
-    import guessit as _guessit  # type: ignore[import]
-
-    _HAS_GUESSIT = True
-except ImportError:
-    _HAS_GUESSIT = False
-    xbmc.log("[PunchPlay] guessit not found — using regex fallback parser", xbmc.LOGDEBUG)
 
 
 # ---------------------------------------------------------------------------
@@ -95,34 +85,6 @@ def _regex_guess(path: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# guessit wrapper
-# ---------------------------------------------------------------------------
-
-def _guessit_guess(path: str) -> dict[str, Any]:
-    try:
-        guess = _guessit.guessit(path)
-    except Exception as exc:
-        xbmc.log(f"[PunchPlay] guessit error: {exc}", xbmc.LOGDEBUG)
-        return _regex_guess(path)
-
-    media_type = "episode" if guess.get("type") == "episode" else "movie"
-    result: dict[str, Any] = {
-        "media_type": media_type,
-        "title": str(guess.get("title") or ""),
-    }
-    if guess.get("year"):
-        result["year"] = int(guess["year"])
-    if media_type == "episode":
-        if guess.get("season") is not None:
-            result["season"] = int(guess["season"])
-        ep = guess.get("episode")
-        if ep is not None:
-            result["episode"] = int(ep) if not isinstance(ep, list) else int(ep[0])
-
-    return result
-
-
-# ---------------------------------------------------------------------------
 # Anime genre detection
 # ---------------------------------------------------------------------------
 
@@ -167,7 +129,7 @@ def identify(
             xbmc.log(f"[PunchPlay] InfoTag parse error: {exc}", xbmc.LOGDEBUG)
 
     # ------------------------------------------------------------------
-    # 2 & 3. Filename parse (guessit or regex fallback), with cache
+    # 2. Filename parse (regex), with cache
     # ------------------------------------------------------------------
     if list_item_path:
         cache_key = f"path:{list_item_path}"
@@ -180,7 +142,7 @@ def identify(
                 )
                 return cached
 
-        guess = _guessit_guess(list_item_path) if _HAS_GUESSIT else _regex_guess(list_item_path)
+        guess = _regex_guess(list_item_path)
 
         if guess.get("title"):
             if cache is not None:
