@@ -6,9 +6,6 @@ Login and logout are triggered via home window properties set by settings.xml
 action buttons, and are handled inside the service loop.
 """
 
-import sys
-
-
 def main() -> None:
     from service import PunchPlayService
 

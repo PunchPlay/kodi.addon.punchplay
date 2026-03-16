@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Regex fallback parser
+# Regex filename parser
 # ---------------------------------------------------------------------------
 
 # Common scene/release tags that appear after the real title.
@@ -46,7 +46,7 @@ def _clean_title(raw: str) -> str:
 
 
 def _regex_guess(path: str) -> dict[str, Any]:
-    """Minimal filename parser used when guessit is unavailable."""
+    """Parse title, year, and episode info from a scene-style filename."""
     name = os.path.splitext(os.path.basename(path))[0]
 
     ep_match = _EP_RE.search(name)

@@ -3,7 +3,7 @@ cache.py — SQLite-backed persistence for PunchPlay Scrobble.
 
 Two tables:
   identifier_cache   — maps file paths / Kodi item keys to resolved metadata
-                        so repeated lookups skip the guessit parse.
+                        so repeated identification on every play event is avoided.
   pending_scrobbles  — offline queue; events written here when the network is
                         down, replayed on the next successful connection.
 """
@@ -141,9 +141,3 @@ class Cache:
                 "DELETE FROM pending_scrobbles WHERE id = ?", (scrobble_id,)
             )
 
-    def pending_count(self) -> int:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM pending_scrobbles"
-            ).fetchone()
-        return row[0] if row else 0
