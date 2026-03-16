@@ -271,7 +271,11 @@ class APIClient:
                     token_resp = self._request(
                         "POST",
                         "/api/auth/device/token",
-                        {"device_code": device_code},
+                        {
+                            "device_code": device_code,
+                            "device_id": self.device_id,
+                            "device_name": xbmc.getInfoLabel("System.FriendlyName") or "Kodi",
+                        },
                         retry_on_401=False,
                     )
                     if token_resp.get("access_token"):
