@@ -54,7 +54,8 @@ class APIClient:
             if device_id:
                 return device_id
         device_id = str(uuid.uuid4())
-        with open(self._device_id_file, "w") as f:
+        fd = os.open(self._device_id_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(device_id)
         return device_id
 
@@ -69,7 +70,8 @@ class APIClient:
 
     def _save_tokens(self, tokens: dict[str, str]) -> None:
         self._tokens = tokens
-        with open(self._token_file, "w") as f:
+        fd = os.open(self._token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(tokens, f, indent=2)
 
     def _headers(self) -> dict[str, str]:
@@ -168,11 +170,19 @@ class APIClient:
                 self._cache.enqueue_scrobble(path, payload)
             return None
         except urllib.error.HTTPError as exc:
-            xbmc.log(
-                f"[PunchPlay] HTTP {exc.code} on {path} — queuing", xbmc.LOGWARNING
-            )
-            if self._cache is not None:
-                self._cache.enqueue_scrobble(path, payload)
+            if 500 <= exc.code < 600:
+                # Transient server error — queue for retry.
+                xbmc.log(
+                    f"[PunchPlay] HTTP {exc.code} on {path} — queuing", xbmc.LOGWARNING
+                )
+                if self._cache is not None:
+                    self._cache.enqueue_scrobble(path, payload)
+            else:
+                # Permanent client error (4xx) — drop, retrying won't help.
+                xbmc.log(
+                    f"[PunchPlay] HTTP {exc.code} on {path} — dropping (permanent error)",
+                    xbmc.LOGWARNING,
+                )
             return None
 
     # ------------------------------------------------------------------

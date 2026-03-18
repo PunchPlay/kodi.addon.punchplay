@@ -168,7 +168,12 @@ class PunchPlayPlayer(xbmc.Player):
                 self._api.post("/api/scrobble/progress", payload)
 
             except Exception as exc:
-                xbmc.log(f"[PunchPlay] Heartbeat error: {exc}", xbmc.LOGDEBUG)
+                xbmc.log(f"[PunchPlay] Heartbeat error: {exc}", xbmc.LOGWARNING)
+                # If the player is no longer valid, stop the heartbeat loop
+                # rather than spinning silently.
+                if not self.isPlayingVideo():
+                    xbmc.log("[PunchPlay] Heartbeat stopping — player no longer active", xbmc.LOGINFO)
+                    return
 
     # ------------------------------------------------------------------
     # Playback events
