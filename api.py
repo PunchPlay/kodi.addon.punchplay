@@ -228,6 +228,8 @@ class APIClient:
         Run the full device-code OAuth flow with Kodi dialogs.
         Returns True on success, False on failure/cancellation.
         """
+        addon = xbmcaddon.Addon(_ADDON_ID)
+        _s = addon.getLocalizedString
         dialog = xbmcgui.Dialog()
 
         # Step 1 — request a device code.
@@ -236,7 +238,7 @@ class APIClient:
                 "POST", "/api/auth/device/code", {}, retry_on_401=False
             )
         except Exception as exc:
-            dialog.ok("PunchPlay — Login", f"Could not reach the server:\n{exc}")
+            dialog.ok(_s(32000), f"{_s(32001)}\n{exc}")
             return False
 
         user_code = resp.get("user_code", "")
@@ -245,19 +247,18 @@ class APIClient:
         expires_in: int = int(resp.get("expires_in", 600))
 
         if not user_code or not device_code:
-            dialog.ok("PunchPlay — Login", "Invalid response from server. Try again.")
+            dialog.ok(_s(32000), _s(32002))
             return False
 
         # Step 2 — show the code to the user.
         dialog.ok(
-            "PunchPlay — Login",
+            _s(32000),
             (
-                f"Open your browser and visit:\n"
+                f"{_s(32003)}\n"
                 f"[B]{verification_uri}[/B]\n\n"
-                f"Enter this code:\n"
+                f"{_s(32004)}\n"
                 f"[B]{user_code}[/B]\n\n"
-                f"The code expires in [B]{expires_in // 60}[/B] minutes.\n"
-                f"Press OK — then this dialog will wait for approval."
+                + _s(32005).format(expires_in // 60)
             ),
         )
 
@@ -265,7 +266,7 @@ class APIClient:
         monitor = xbmc.Monitor()
         deadline = time.monotonic() + expires_in
         progress = xbmcgui.DialogProgress()
-        progress.create("PunchPlay — Waiting for Login", "Waiting for approval…")
+        progress.create(_s(32006), _s(32007))
 
         try:
             while time.monotonic() < deadline and not monitor.abortRequested():
@@ -275,7 +276,7 @@ class APIClient:
 
                 remaining = max(0, int(deadline - time.monotonic()))
                 pct = int(100 * (1 - remaining / expires_in))
-                progress.update(pct, f"Waiting for approval… ({remaining}s remaining)")
+                progress.update(pct, _s(32008).format(remaining))
 
                 try:
                     token_resp = self._request(
@@ -293,17 +294,14 @@ class APIClient:
                         self._save_tokens(token_resp)
                         xbmc.log("[PunchPlay] Device-code login succeeded", xbmc.LOGINFO)
                         xbmcgui.Dialog().notification(
-                            "PunchPlay",
-                            "Login successful!",
-                            xbmcgui.NOTIFICATION_INFO,
-                            4000,
+                            "PunchPlay", _s(32011), xbmcgui.NOTIFICATION_INFO, 4000
                         )
                         return True
 
                     error = token_resp.get("error", "")
                     if error in ("expired", "access_denied"):
                         progress.close()
-                        dialog.ok("PunchPlay — Login", f"Login failed ({error}). Please try again.")
+                        dialog.ok(_s(32000), _s(32009).format(error))
                         return False
                     # 'authorization_pending' or 'slow_down' → keep polling.
 
@@ -319,7 +317,7 @@ class APIClient:
             except Exception:
                 pass
 
-        dialog.ok("PunchPlay — Login", "Login timed out. Please try again.")
+        dialog.ok(_s(32000), _s(32010))
         return False
 
     # ------------------------------------------------------------------
@@ -333,7 +331,8 @@ class APIClient:
         self._tokens = {}
         xbmc.log("[PunchPlay] Tokens cleared (logged out)", xbmc.LOGINFO)
         xbmcgui.Dialog().notification(
-            "PunchPlay", "Logged out.", xbmcgui.NOTIFICATION_INFO, 3000
+            "PunchPlay", xbmcaddon.Addon(_ADDON_ID).getLocalizedString(32012),
+            xbmcgui.NOTIFICATION_INFO, 3000
         )
 
     # ------------------------------------------------------------------

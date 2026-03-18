@@ -317,14 +317,15 @@ class PunchPlayPlayer(xbmc.Player):
             )
             self._api.post("/api/scrobble/stop", payload)
             if watched:
-                title = self._metadata.get("title", "Unknown")
+                _s = xbmcaddon.Addon(_ADDON_ID).getLocalizedString
+                title = self._metadata.get("title", "")
                 media_type = self._metadata.get("media_type", "movie")
                 if media_type == "episode":
                     season = self._metadata.get("season")
                     episode = self._metadata.get("episode")
-                    msg = f"✓ {title} S{season:02d}E{episode:02d} scrobbled"
+                    msg = _s(32014).format(title, f"{season:02d}", f"{episode:02d}")
                 else:
-                    msg = f"✓ {title} scrobbled"
+                    msg = _s(32013).format(title)
                 self._notify(msg, settings)
         except Exception as exc:
             xbmc.log(f"[PunchPlay] Stop emit error: {exc}", xbmc.LOGDEBUG)
