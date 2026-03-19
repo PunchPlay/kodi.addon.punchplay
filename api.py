@@ -153,13 +153,13 @@ class APIClient:
     # Scrobble POST (with offline queue fallback)
     # ------------------------------------------------------------------
 
-    def _should_drop_client_error(self, status_code: int) -> bool:
+    def _is_permanent_client_error(self, status_code: int) -> bool:
         """
         Return True when a client error is permanent and retrying will not help.
 
-        401 is handled specially: if a queued replay still gets a 401 after the
-        built-in refresh attempt, keep the event so it can be retried after the
-        user logs in again.
+        401 is excluded: a queued event that still gets a 401 after the built-in
+        refresh attempt should stay in the queue so it can be retried once the
+        user logs in again.  All other 4xx errors are permanent.
         """
         return 400 <= status_code < 500 and status_code != 401
 
@@ -187,7 +187,7 @@ class APIClient:
                 )
                 if self._cache is not None:
                     self._cache.enqueue_scrobble(path, payload)
-            elif not self._should_drop_client_error(exc.code):
+            elif not self._is_permanent_client_error(exc.code):
                 xbmc.log(
                     f"[PunchPlay] HTTP {exc.code} on {path} — preserving for retry",
                     xbmc.LOGWARNING,
@@ -228,7 +228,7 @@ class APIClient:
                 xbmc.log("[PunchPlay] Still offline — stopping queue flush", xbmc.LOGDEBUG)
                 break  # remain offline; try again later
             except urllib.error.HTTPError as exc:
-                if self._should_drop_client_error(exc.code):
+                if self._is_permanent_client_error(exc.code):
                     xbmc.log(
                         f"[PunchPlay] HTTP {exc.code} replaying id={scrobble_id} — dropping",
                         xbmc.LOGWARNING,
