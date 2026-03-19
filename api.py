@@ -153,6 +153,16 @@ class APIClient:
     # Scrobble POST (with offline queue fallback)
     # ------------------------------------------------------------------
 
+    def _should_drop_client_error(self, status_code: int) -> bool:
+        """
+        Return True when a client error is permanent and retrying will not help.
+
+        401 is handled specially: if a queued replay still gets a 401 after the
+        built-in refresh attempt, keep the event so it can be retried after the
+        user logs in again.
+        """
+        return 400 <= status_code < 500 and status_code != 401
+
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         """
         POST *payload* to *path*.  On network error, writes the event to the
@@ -174,6 +184,13 @@ class APIClient:
                 # Transient server error — queue for retry.
                 xbmc.log(
                     f"[PunchPlay] HTTP {exc.code} on {path} — queuing", xbmc.LOGWARNING
+                )
+                if self._cache is not None:
+                    self._cache.enqueue_scrobble(path, payload)
+            elif not self._should_drop_client_error(exc.code):
+                xbmc.log(
+                    f"[PunchPlay] HTTP {exc.code} on {path} — preserving for retry",
+                    xbmc.LOGWARNING,
                 )
                 if self._cache is not None:
                     self._cache.enqueue_scrobble(path, payload)
@@ -211,13 +228,19 @@ class APIClient:
                 xbmc.log("[PunchPlay] Still offline — stopping queue flush", xbmc.LOGDEBUG)
                 break  # remain offline; try again later
             except urllib.error.HTTPError as exc:
+                if self._should_drop_client_error(exc.code):
+                    xbmc.log(
+                        f"[PunchPlay] HTTP {exc.code} replaying id={scrobble_id} — dropping",
+                        xbmc.LOGWARNING,
+                    )
+                    self._cache.delete_pending_scrobble(scrobble_id)
+                    continue
+
                 xbmc.log(
-                    f"[PunchPlay] HTTP {exc.code} replaying id={scrobble_id} — dropping",
+                    f"[PunchPlay] HTTP {exc.code} replaying id={scrobble_id} — keeping queued",
                     xbmc.LOGWARNING,
                 )
-                # Drop unrecoverable server errors (4xx) so they don't block the queue.
-                if 400 <= exc.code < 500:
-                    self._cache.delete_pending_scrobble(scrobble_id)
+                break
 
     # ------------------------------------------------------------------
     # Device-code login

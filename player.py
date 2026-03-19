@@ -323,7 +323,10 @@ class PunchPlayPlayer(xbmc.Player):
                 if media_type == "episode":
                     season = self._metadata.get("season")
                     episode = self._metadata.get("episode")
-                    msg = _s(32014).format(title, f"{season:02d}", f"{episode:02d}")
+                    if isinstance(season, int) and isinstance(episode, int):
+                        msg = _s(32014).format(title, f"{season:02d}", f"{episode:02d}")
+                    else:
+                        msg = _s(32013).format(title)
                 else:
                     msg = _s(32013).format(title)
                 self._notify(msg, settings)
