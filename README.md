@@ -38,7 +38,9 @@ Open **Settings → Add-ons → My add-ons → Services → PunchPlay Scrobble �
 | **Heartbeat interval (sec)** | 30 | How often progress is reported during playback. |
 | **Scrobble movies** | On | Toggle movie tracking. |
 | **Scrobble TV shows** | On | Toggle TV episode tracking. |
-| **Scrobble anime** | On | Toggle anime tracking (detected by genre tag). |
+| **Scrobble anime** | On | Toggle anime tracking (detected by `"anime"` genre tag). |
+| **Show scrobble notifications** | On | Show a Kodi notification when a watch is successfully scrobbled. |
+| **Show notifications during playback** | Off | If off, scrobble notifications are suppressed while another video is playing. |
 
 ---
 
@@ -143,7 +145,10 @@ script.punchplay/
 ├── changelog.txt           Version history
 ├── LICENSE.txt             GPL-2.0
 └── resources/
-    └── settings.xml        Addon settings UI
+    ├── settings.xml        Addon settings UI
+    └── language/
+        └── resource.language.en_gb/
+            └── strings.po  Localised UI strings
 ```
 
 ---
