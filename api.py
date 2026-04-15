@@ -23,7 +23,7 @@ import xbmcgui
 import xbmcvfs
 
 _ADDON_ID = "script.punchplay"
-_VERSION = "1.0.0"
+_VERSION = "1.0.1"
 
 
 class APIClient:
@@ -273,14 +273,13 @@ class APIClient:
             dialog.ok(_s(32000), _s(32002))
             return False
 
-        # Step 2 — show the code to the user.
+        # Step 2 — show the code to the user.  Kept short so everything
+        # fits on screen without the dialog needing to scroll.
         dialog.ok(
             _s(32000),
             (
-                f"{_s(32003)}\n"
-                f"[B]{verification_uri}[/B]\n\n"
-                f"{_s(32004)}\n"
-                f"[B]{user_code}[/B]\n\n"
+                f"{_s(32003)} [B]{verification_uri}[/B]\n"
+                f"{_s(32004)} [B]{user_code}[/B]\n\n"
                 + _s(32005).format(expires_in // 60)
             ),
         )

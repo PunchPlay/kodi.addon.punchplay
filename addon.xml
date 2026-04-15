@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <addon id="script.punchplay"
        name="PunchPlay Scrobble"
-       version="1.0.0"
+       version="1.0.1"
        provider-name="PunchPlay">
 
   <requires>
@@ -26,7 +26,7 @@
     <forum/>
     <website>https://punchplay.tv</website>
     <source>https://github.com/PunchPlay/script.punchplay</source>
-    <news>1.0.0 - Initial release</news>
+    <news>1.0.1 - Fix login code not visible at top of dialog; various stability fixes</news>
     <assets>
       <icon>icon.png</icon>
       <fanart>fanart.jpg</fanart>
