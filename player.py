@@ -21,7 +21,7 @@ import xbmcaddon
 import xbmcgui
 
 _ADDON_ID = "script.punchplay"
-_VERSION = "1.0.1"
+_VERSION = "1.0.2"
 
 
 class PunchPlayPlayer(xbmc.Player):

@@ -9,6 +9,7 @@ Responsibilities:
   • Device-code login flow with a Kodi progress dialog.
 """
 
+import base64
 import json
 import os
 import time
@@ -23,7 +24,7 @@ import xbmcgui
 import xbmcvfs
 
 _ADDON_ID = "script.punchplay"
-_VERSION = "1.0.1"
+_VERSION = "1.0.2"
 
 
 class APIClient:
@@ -243,6 +244,76 @@ class APIClient:
                 break
 
     # ------------------------------------------------------------------
+    # Device-code login — QR dialog helpers
+    # ------------------------------------------------------------------
+
+    def _write_qr_image(self, data_uri: str) -> str | None:
+        """
+        Decode a `data:image/png;base64,...` payload and write it to
+        addon_data/login_qr.png.  Returns the absolute path on success or
+        None if the payload is malformed / IO fails.
+        """
+        prefix = "data:image/png;base64,"
+        if not data_uri.startswith(prefix):
+            return None
+        try:
+            png_bytes = base64.b64decode(data_uri[len(prefix):], validate=True)
+        except Exception as exc:
+            xbmc.log(f"[PunchPlay] QR decode failed: {exc}", xbmc.LOGWARNING)
+            return None
+
+        path = os.path.join(self._data_dir, "login_qr.png")
+        try:
+            with open(path, "wb") as f:
+                f.write(png_bytes)
+        except OSError as exc:
+            xbmc.log(f"[PunchPlay] QR write failed: {exc}", xbmc.LOGWARNING)
+            return None
+        return path
+
+    def _show_qr_login_dialog(
+        self,
+        *,
+        qr_path: str,
+        verification_uri: str,
+        user_code: str,
+        expires_in: int,
+    ) -> bool:
+        """
+        Present the custom LoginDialog.  Returns True on success, False
+        if the dialog cannot be shown so the caller can fall back.
+        """
+        try:
+            from login_dialog import LoginDialog
+
+            addon = xbmcaddon.Addon(_ADDON_ID)
+            _s = addon.getLocalizedString
+            bg_path = os.path.join(
+                addon.getAddonInfo("path"),
+                "resources", "media", "background.png",
+            )
+            minutes = max(1, expires_in // 60)
+
+            dialog = LoginDialog(
+                bg_path=bg_path,
+                qr_path=qr_path,
+                title=_s(32015),
+                scan_label=_s(32016),
+                or_visit_label=_s(32017),
+                uri=verification_uri,
+                code_label=_s(32018),
+                code=user_code,
+                expires_label=_s(32005).format(minutes),
+                dismiss_hint=_s(32019),
+            )
+            dialog.doModal()
+            del dialog
+            return True
+        except Exception as exc:
+            xbmc.log(f"[PunchPlay] QR dialog failed: {exc}", xbmc.LOGWARNING)
+            return False
+
+    # ------------------------------------------------------------------
     # Device-code login
     # ------------------------------------------------------------------
 
@@ -266,6 +337,7 @@ class APIClient:
 
         user_code = resp.get("user_code", "")
         verification_uri = resp.get("verification_uri", self._base_url())
+        verification_uri_qr = resp.get("verification_uri_qr", "")
         device_code = resp.get("device_code", "")
         expires_in: int = int(resp.get("expires_in", 600))
 
@@ -273,16 +345,29 @@ class APIClient:
             dialog.ok(_s(32000), _s(32002))
             return False
 
-        # Step 2 — show the code to the user.  Kept short so everything
-        # fits on screen without the dialog needing to scroll.
-        dialog.ok(
-            _s(32000),
-            (
-                f"{_s(32003)} [B]{verification_uri}[/B]\n"
-                f"{_s(32004)} [B]{user_code}[/B]\n\n"
-                + _s(32005).format(expires_in // 60)
-            ),
-        )
+        # Step 2 — show the code to the user.  Prefer the QR window when
+        # the backend provides one; otherwise fall back to a compact
+        # text-only dialog that still fits on screen without scrolling.
+        shown_qr_dialog = False
+        if verification_uri_qr:
+            qr_path = self._write_qr_image(verification_uri_qr)
+            if qr_path:
+                shown_qr_dialog = self._show_qr_login_dialog(
+                    qr_path=qr_path,
+                    verification_uri=verification_uri,
+                    user_code=user_code,
+                    expires_in=expires_in,
+                )
+
+        if not shown_qr_dialog:
+            dialog.ok(
+                _s(32000),
+                (
+                    f"{_s(32003)} [B]{verification_uri}[/B]\n"
+                    f"{_s(32004)} [B]{user_code}[/B]\n\n"
+                    + _s(32005).format(expires_in // 60)
+                ),
+            )
 
         # Step 3 — poll for the token with a cancellable progress dialog.
         monitor = xbmc.Monitor()

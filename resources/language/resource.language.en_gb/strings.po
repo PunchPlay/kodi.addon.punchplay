@@ -65,3 +65,23 @@ msgstr ""
 msgctxt "#32014"
 msgid "{0} S{1}E{2} scrobbled"
 msgstr ""
+
+msgctxt "#32015"
+msgid "Connect Kodi to PunchPlay"
+msgstr ""
+
+msgctxt "#32016"
+msgid "Scan with your phone camera"
+msgstr ""
+
+msgctxt "#32017"
+msgid "Or visit:"
+msgstr ""
+
+msgctxt "#32018"
+msgid "And enter this code:"
+msgstr ""
+
+msgctxt "#32019"
+msgid "Press OK or Back to continue"
+msgstr ""
