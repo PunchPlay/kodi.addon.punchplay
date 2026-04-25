@@ -1,3 +1,12 @@
+v1.0.3 (2026-04-25)
+- Fix crash on Python 3.8 (Kodi Nexus on Windows) caused by modern
+  type hint syntax; added `from __future__ import annotations` to all files
+- Fix login poll silently swallowing HTTP errors — expired/access_denied
+  are now properly detected and reported to the user
+- Fix stale QR image on re-login (Kodi texture cache bypass)
+- Wrap os.listdir in try/except for QR cleanup resilience
+- Only update flush timestamp on success (restore correct retry behaviour)
+
 v1.0.2 (2026-04-15)
 - Login dialog now shows a scannable QR code alongside the device code.
   Scan with your phone to open punchplay.tv/link with the code pre-filled.

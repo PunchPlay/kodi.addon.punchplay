@@ -26,7 +26,7 @@ import xbmcgui
 import xbmcvfs
 
 _ADDON_ID = "script.punchplay"
-_VERSION = "1.0.2"
+_VERSION = "1.0.3"
 
 
 class APIClient:
