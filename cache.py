@@ -143,3 +143,8 @@ class Cache:
                 "DELETE FROM pending_scrobbles WHERE id = ?", (scrobble_id,)
             )
 
+    def clear_pending_scrobbles(self) -> None:
+        """Remove all pending scrobbles (e.g. on logout)."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM pending_scrobbles")
+
