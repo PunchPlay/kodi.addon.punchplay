@@ -1,152 +1,146 @@
-# PunchPlay Scrobble — Kodi Addon
+# PunchPlay Scrobble for Kodi
 
-Automatically tracks movies and TV episodes you watch in Kodi and posts them to your **[PunchPlay.tv](https://punchplay.tv)** account in real time.
+PunchPlay Scrobble is a Kodi service addon that tracks movies and TV episodes you watch in Kodi and sends them to your [PunchPlay.tv](https://punchplay.tv) account.
 
-Supported Kodi versions: **Nexus (20)** and **Omega (21)**, Python 3 only.
+It supports Kodi Nexus 20 and Omega 21.
 
----
+## Install
 
-## Installation
+1. Download the latest addon zip:
+   [script.punchplay.zip](https://github.com/PunchPlay/script.punchplay/releases/latest/download/script.punchplay.zip)
+2. In Kodi, open **Settings -> Add-ons -> Install from zip file**.
+3. Choose the downloaded zip.
+4. Kodi installs the addon and starts the background service automatically.
 
-### Option A — Direct download (recommended)
+If Kodi blocks zip installs, enable **Settings -> System -> Add-ons -> Unknown sources** first.
 
-1. **[Download script.punchplay.zip](https://github.com/PunchPlay/script.punchplay/releases/latest/download/script.punchplay.zip)**
-2. In Kodi: **Settings → Add-ons → Install from zip file**
-3. Navigate to the downloaded zip and confirm — Kodi installs and starts the service immediately.
+## Connect Your Account
 
-### Option B — Kodi addon store
-
-Once approved, install directly from **Settings → Add-ons → Install from repository → Kodi Add-on repository → Services → PunchPlay Scrobble**.
-
----
-
-## Configuration
-
-Open **Settings → Add-ons → My add-ons → Services → PunchPlay Scrobble → Configure**.
-
-| Setting | Default | Description |
-|---|---|---|
-| **Backend URL** | `https://punchplay.tv` | Base URL of the PunchPlay API. Leave as-is unless self-hosting. |
-| **Watched threshold (%)** | 70 | Minimum play percentage before an item is marked as watched. |
-| **Minimum file length (min)** | 5 | Files shorter than this are ignored (trailers, clips). |
-| **Heartbeat interval (sec)** | 30 | How often progress is reported during playback. |
-| **Scrobble movies** | On | Toggle movie tracking. |
-| **Scrobble TV shows** | On | Toggle TV episode tracking. |
-| **Scrobble anime** | On | Toggle anime tracking (detected by `"anime"` genre tag). |
-| **Show scrobble notifications** | On | Show a Kodi notification when a watch is successfully scrobbled. |
-| **Show notifications during playback** | Off | If off, scrobble notifications are suppressed while another video is playing. |
-
----
-
-## Logging In
-
-1. Open the addon settings.
+1. In Kodi, open **Settings -> Add-ons -> My add-ons -> Services -> PunchPlay Scrobble -> Configure**.
 2. Click **Login to PunchPlay**.
-3. A dialog will show a short code and a URL:
+3. Scan the QR code or visit `https://punchplay.tv/link`.
+4. Sign in and approve the code shown in Kodi.
+5. The Kodi dialog closes automatically once the device is connected.
 
-   ```
-   Visit: https://punchplay.tv/link
-   Enter code: ABCD-1234
-   ```
+Tokens are stored locally in Kodi's addon data directory and refreshed automatically. Use **Logout** in the addon settings to disconnect the device and clear pending offline scrobbles.
 
-4. Open the URL on any device, sign in to your PunchPlay account, and approve the request.
-5. Kodi polls automatically — you'll see a "Login successful!" notification within seconds.
+## What It Tracks
 
-Tokens are stored in the Kodi addon data directory (`userdata/addon_data/script.punchplay/`) and refreshed automatically. You only need to log in once.
+The addon sends these playback events to PunchPlay:
 
-To log out, click **Logout** in the addon settings.
+| Kodi event | PunchPlay endpoint | Purpose |
+| --- | --- | --- |
+| Playback starts | `/api/scrobble/start` | Creates or updates now-playing progress |
+| Pause | `/api/scrobble/pause` | Saves the current position |
+| Resume | `/api/scrobble/resume` | Marks the item active again |
+| Progress heartbeat | `/api/scrobble/progress` | Updates continue-watching progress |
+| Stop or end | `/api/scrobble/stop` | Saves progress or logs a completed watch |
 
----
+The default watched threshold is 70%. When playback reaches the configured threshold, PunchPlay adds the item to your watch history. Stops below the threshold are kept as continue-watching progress.
 
-## How It Works
+## Current Features
 
+- Automatic movie and TV episode scrobbling.
+- Continue-watching progress on PunchPlay.
+- Post-watch rating dialog for movies and episodes.
+- One-click import of watched Kodi library items.
+- QR/device-code login.
+- Token refresh on expired access tokens.
+- Offline queue for network failures.
+- Per-playback session IDs to prevent stale queued progress from reappearing after a completed stop.
+- Anime toggle based on Kodi's `anime` genre tag.
+
+## Settings
+
+Open **Configure** from the addon details page.
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| Backend URL | `https://punchplay.tv` | Hidden by default. Leave unchanged unless testing another backend. |
+| Login to PunchPlay | - | Starts QR/device-code login. |
+| Logout | - | Clears tokens and queued offline scrobbles. |
+| Scrobble movies | On | Enables movie tracking. |
+| Scrobble TV shows | On | Enables episode tracking. |
+| Scrobble anime | On | Applies to episodes with the `anime` genre. |
+| Rate after watching | On | Shows the PunchPlay rating dialog after a completed scrobble. |
+| Show scrobble notifications | On | Shows Kodi notifications for completed scrobbles. |
+| Show notifications during playback | Off | Keeps notifications quiet while another video is already playing. |
+| Watched threshold (%) | 70 | Minimum progress needed to log a completed watch. |
+| Minimum file length (minutes) | 5 | Ignores trailers and short clips. |
+| Heartbeat interval (seconds) | 30 | Frequency of progress posts. Position is cached more often internally for reliable stop handling. |
+| Sync Kodi Library | - | Imports watched movies and episodes from Kodi's local library. |
+
+## Media Matching
+
+PunchPlay Scrobble identifies media in this order:
+
+1. Kodi library metadata from `InfoTagVideo`, including TMDB, TVDB, IMDb, season, and episode IDs when Kodi has them.
+2. Filename parsing for common movie and episode names such as `Show.S01E02.1080p.WEB-DL.mkv`.
+3. Server-side PunchPlay/TMDB matching when the addon only has a title or filename.
+
+Keeping your Kodi library scraped with TMDB-compatible IDs gives the most accurate results.
+
+## Offline Behavior
+
+If PunchPlay cannot be reached, scrobble events are written to a local SQLite queue in Kodi addon data. The queue is replayed in order when the connection returns.
+
+The queue is capped at 200 events. Completed playback sessions clear their older queued progress events before sending the final stop event, which prevents old progress from bringing a watched item back into continue-watching.
+
+## Library Sync
+
+Use **Configure -> Library -> Sync Kodi Library** to import existing watched items from Kodi into PunchPlay.
+
+The sync reads watched movies and episodes from Kodi's video library using JSON-RPC, sends them in batches, and skips duplicates server-side.
+
+## Development Checks
+
+Before publishing a release:
+
+```bash
+python3 -m py_compile api.py cache.py default.py identifier.py login_dialog.py player.py rating_dialog.py service.py
+kodi-addon-checker --branch omega script.punchplay/
 ```
-Kodi player event
-       │
-       ▼
-  PunchPlayPlayer (player.py)
-       │  identify via Kodi library metadata → identifier.py
-       │  fallback: regex filename parser    → identifier.py
-       │  cache lookup/store                 → cache.py (SQLite)
-       │
-       ▼
-  APIClient (api.py)
-       │  POST /api/scrobble/start|pause|resume|stop|progress
-       │  Bearer token attached automatically
-       │  401 → refresh token and retry once
-       │  network error → write to offline queue (SQLite)
-       │
-       ▼
-  PunchPlay REST API
+
+Build the zip from the parent directory:
+
+```bash
+zip -r /tmp/script.punchplay.zip script.punchplay \
+  -x 'script.punchplay/.git/*' \
+     'script.punchplay/__pycache__/*' \
+     'script.punchplay/*/__pycache__/*' \
+     'script.punchplay/.DS_Store' \
+     'script.punchplay/**/.DS_Store'
 ```
 
-### Media identification
+Upload the asset as `script.punchplay.zip` on the latest GitHub release. The PunchPlay website download button points at:
 
-1. **Kodi library metadata** — if the item is in your library, Kodi provides the title, year, TMDB/TVDB IDs directly. Most accurate.
-2. **Regex filename parser** — extracts title, year, and episode info from scene-style filenames (e.g. `Show.S01E02.1080p.WEB-DL.mkv`).
-3. **Server-side TMDB search** — if neither method yields a TMDB ID, the server searches TMDB by title and year as a final fallback.
-
-### Scrobble events
-
-| Event | Endpoint | Triggered when |
-|---|---|---|
-| Start | `POST /api/scrobble/start` | Playback begins |
-| Pause | `POST /api/scrobble/pause` | Player paused |
-| Resume | `POST /api/scrobble/resume` | Player resumed |
-| Progress | `POST /api/scrobble/progress` | Every N seconds during playback |
-| Stop | `POST /api/scrobble/stop` | User stops or file ends |
-
-Stop events include `"watched": true` when the play percentage meets or exceeds the configured threshold, triggering a full scrobble to your watch history. Partial stops (below threshold) save your position for the "Continue Watching" section on your profile.
-
-All requests share the same JSON payload:
-
-```json
-{
-  "media_type": "movie",
-  "title": "Inception",
-  "year": 2010,
-  "tmdb_id": 27205,
-  "imdb_id": "tt1375666",
-  "progress": 0.72,
-  "duration_seconds": 8880,
-  "position_seconds": 6394,
-  "device_id": "uuid-stored-per-device",
-  "client_version": "1.0.0"
-}
+```text
+https://github.com/PunchPlay/script.punchplay/releases/latest/download/script.punchplay.zip
 ```
 
-Optional fields (`imdb_id`, `tmdb_id`, `tvdb_id`, `season`, `episode`, `year`) are omitted when unavailable.
+## File Layout
 
-### Offline resilience
-
-Failed POSTs are written to a local SQLite queue (capped at 200 events). The queue flushes every 60 seconds and also immediately before each new start event. Events replay in order; unrecoverable 4xx errors are discarded so they don't block the queue.
-
----
-
-## File layout
-
-```
+```text
 script.punchplay/
-├── addon.xml               Addon metadata and extension points
-├── default.py              Entry point — launches the background service
-├── service.py              xbmc.Monitor — main loop, login/logout, queue flush
-├── player.py               xbmc.Player — playback events and heartbeat thread
-├── api.py                  HTTP client (auth, token refresh, offline queue)
-├── identifier.py           Media identification (library metadata + regex parser)
-├── cache.py                SQLite: identifier cache + offline scrobble queue
-├── icon.png                Addon icon (256×256)
-├── fanart.jpg              Addon fanart (1280×720)
-├── changelog.txt           Version history
-├── LICENSE.txt             GPL-2.0
+├── addon.xml
+├── default.py
+├── service.py
+├── player.py
+├── api.py
+├── identifier.py
+├── cache.py
+├── login_dialog.py
+├── rating_dialog.py
+├── icon.png
+├── fanart.jpg
+├── changelog.txt
+├── LICENSE.txt
 └── resources/
-    ├── settings.xml        Addon settings UI
-    └── language/
-        └── resource.language.en_gb/
-            └── strings.po  Localised UI strings
+    ├── settings.xml
+    ├── media/background.png
+    └── language/resource.language.en_gb/strings.po
 ```
-
----
 
 ## License
 
-GPL-2.0 — see [LICENSE.txt](LICENSE.txt).
+GPL-2.0-only. See [LICENSE.txt](LICENSE.txt).
