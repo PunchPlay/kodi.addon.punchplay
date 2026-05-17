@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import uuid
 from typing import Any
 
 import xbmc
@@ -24,7 +25,7 @@ import xbmcaddon
 import xbmcgui
 
 _ADDON_ID = "script.punchplay"
-_VERSION = "1.1.0"
+_VERSION = "1.1.1"
 
 
 class PunchPlayPlayer(xbmc.Player):
@@ -36,6 +37,7 @@ class PunchPlayPlayer(xbmc.Player):
         # State for the currently tracked item.
         self._metadata: dict[str, Any] | None = None
         self._is_playing: bool = False
+        self._playback_session_id: str | None = None
 
         # Last known playback position — used as fallback in _emit_stop when
         # getTime()/getTotalTime() throw because the player has already closed.
@@ -111,6 +113,8 @@ class PunchPlayPlayer(xbmc.Player):
             "duration_seconds": int(duration),
             "position_seconds": int(position),
             "device_id": self._api.device_id,
+            "playback_session_id": self._playback_session_id,
+            "event_created_at": int(time.time() * 1000),
             "client_version": _VERSION,
         }
         for field in ("year", "imdb_id", "tmdb_id", "tvdb_id", "season", "episode", "raw_filename"):
@@ -118,6 +122,17 @@ class PunchPlayPlayer(xbmc.Player):
             if val is not None:
                 payload[field] = val
         return payload
+
+    def _capture_position(self) -> tuple[float, float] | None:
+        """Read and cache the current Kodi playback position."""
+        try:
+            position = self.getTime()
+            duration = self.getTotalTime()
+        except Exception:
+            return None
+        self._last_position = position
+        self._last_duration = duration
+        return position, duration
 
     # ------------------------------------------------------------------
     # Heartbeat thread
@@ -147,6 +162,8 @@ class PunchPlayPlayer(xbmc.Player):
             while slept < interval:
                 if self._hb_stop.is_set():
                     return
+                if self._is_playing and self._metadata is not None:
+                    self._capture_position()
                 time.sleep(0.5)
                 slept += 0.5
 
@@ -154,10 +171,10 @@ class PunchPlayPlayer(xbmc.Player):
                 continue
 
             try:
-                position = self.getTime()
-                duration = self.getTotalTime()
-                self._last_position = position
-                self._last_duration = duration
+                captured = self._capture_position()
+                if captured is None:
+                    continue
+                position, duration = captured
                 settings = self._settings()  # re-read in case changed
 
                 if duration < settings["min_length_secs"]:
@@ -236,10 +253,12 @@ class PunchPlayPlayer(xbmc.Player):
 
             self._metadata = metadata
             self._is_playing = True
+            self._playback_session_id = str(uuid.uuid4())
             self._last_position = 0.0
             self._last_duration = 0.0
 
-            position = self.getTime()
+            captured = self._capture_position()
+            position = captured[0] if captured else 0.0
             payload = self._build_payload(metadata, position, duration)
 
             xbmc.log(
@@ -262,10 +281,12 @@ class PunchPlayPlayer(xbmc.Player):
         try:
             self._is_playing = False
             self._stop_heartbeat()
-            position = self.getTime()
-            duration = self.getTotalTime()
-            self._last_position = position
-            self._last_duration = duration
+            captured = self._capture_position()
+            if captured is None:
+                position = self._last_position
+                duration = self._last_duration
+            else:
+                position, duration = captured
             payload = self._build_payload(self._metadata, position, duration)
             xbmc.log(f"[PunchPlay] Paused at {position:.0f}s", xbmc.LOGDEBUG)
             self._api.post("/api/scrobble/pause", payload)
@@ -277,8 +298,12 @@ class PunchPlayPlayer(xbmc.Player):
             return
         try:
             self._is_playing = True
-            position = self.getTime()
-            duration = self.getTotalTime()
+            captured = self._capture_position()
+            if captured is None:
+                position = self._last_position
+                duration = self._last_duration
+            else:
+                position, duration = captured
             payload = self._build_payload(self._metadata, position, duration)
             xbmc.log(f"[PunchPlay] Resumed at {position:.0f}s", xbmc.LOGDEBUG)
             self._api.post("/api/scrobble/resume", payload)
@@ -301,16 +326,15 @@ class PunchPlayPlayer(xbmc.Player):
         if self._metadata is None:
             return
         try:
-            try:
-                position = self.getTime()
-                duration = self.getTotalTime()
-                self._last_position = position
-                self._last_duration = duration
-            except Exception:
+            captured = self._capture_position()
+            if captured is None:
                 # Player already closed — use last cached values.
                 position = self._last_position
                 duration = self._last_duration
+            else:
+                position, duration = captured
             payload = self._build_payload(self._metadata, position, duration)
+            payload["watched_threshold"] = settings["watched_threshold"]
             watched = duration > 0 and payload["progress"] >= settings["watched_threshold"]
             if watched:
                 payload["watched"] = True
@@ -324,6 +348,8 @@ class PunchPlayPlayer(xbmc.Player):
                 f"pos={payload['position_seconds']}s",
                 xbmc.LOGINFO,
             )
+            if self._playback_session_id and self._cache is not None:
+                self._cache.delete_pending_scrobbles_for_session(self._playback_session_id)
             stop_resp = self._api.post("/api/scrobble/stop", payload)
             if watched:
                 _s = xbmcaddon.Addon(_ADDON_ID).getLocalizedString
@@ -434,6 +460,7 @@ class PunchPlayPlayer(xbmc.Player):
             self._emit_stop(self._settings())
         finally:
             self._metadata = None
+            self._playback_session_id = None
 
     # ------------------------------------------------------------------
     # Cleanup (called on service shutdown)
@@ -443,3 +470,4 @@ class PunchPlayPlayer(xbmc.Player):
         self._is_playing = False
         self._stop_heartbeat()
         self._metadata = None
+        self._playback_session_id = None

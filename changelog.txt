@@ -1,3 +1,12 @@
+v1.1.1 (2026-05-17)
+- Improve watched-threshold detection by caching playback position between
+  heartbeat events, reducing missed 70% scrobbles when Kodi closes playback
+  before the final position can be read.
+- Add playback session IDs and event timestamps to prevent stale queued
+  progress from reappearing after a completed stop event.
+- Preserve PunchPlay link callback URLs through login so QR/device-code
+  approval returns to the pre-filled connection page.
+
 v1.1.0 (2026-04-28)
 - Rate movies and episodes right in Kodi after the watched threshold is met.
   A 1–10 rating dialog appears after the scrobble notification. Configurable

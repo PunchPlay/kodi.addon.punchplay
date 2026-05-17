@@ -143,8 +143,31 @@ class Cache:
                 "DELETE FROM pending_scrobbles WHERE id = ?", (scrobble_id,)
             )
 
+    def delete_pending_scrobbles_for_session(self, playback_session_id: str) -> None:
+        """Remove queued events for a playback session superseded by its stop."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, payload FROM pending_scrobbles ORDER BY id"
+            ).fetchall()
+            ids: list[int] = []
+            for row in rows:
+                try:
+                    payload = json.loads(row[1])
+                except Exception:
+                    continue
+                if payload.get("playback_session_id") == playback_session_id:
+                    ids.append(row[0])
+            if ids:
+                conn.executemany(
+                    "DELETE FROM pending_scrobbles WHERE id = ?",
+                    [(scrobble_id,) for scrobble_id in ids],
+                )
+                xbmc.log(
+                    f"[PunchPlay] Cleared {len(ids)} queued event(s) for completed session",
+                    xbmc.LOGDEBUG,
+                )
+
     def clear_pending_scrobbles(self) -> None:
         """Remove all pending scrobbles (e.g. on logout)."""
         with self._connect() as conn:
             conn.execute("DELETE FROM pending_scrobbles")
-
