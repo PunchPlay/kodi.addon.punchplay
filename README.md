@@ -233,6 +233,8 @@ zip -r /tmp/script.punchplay.zip "$repo_dir" \
   -x "$repo_dir/.git/*" \
      "$repo_dir/.github/*" \
      "$repo_dir/tests/*" \
+     "$repo_dir/docs/*" \
+     "$repo_dir/README.md" \
      "$repo_dir/__pycache__/*" \
      "$repo_dir/**/__pycache__/*" \
      "$repo_dir/.DS_Store" \
