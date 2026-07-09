@@ -63,6 +63,19 @@ PULL_SYNC_OVERLAP_SECS = 60 * 60
 PULL_SYNC_TIMEOUT_SECS = 60
 AUTO_PULL_CHECK_INTERVAL_SECS = 60
 
+# Live watched-state sync (VideoLibrary.OnUpdate → PunchPlay import).
+LIVE_SYNC_DEBOUNCE_SECS = 2.0
+LIVE_SYNC_MAX_BATCH = 100
+# How long after playback a library item's playcount bump is treated as an
+# echo of our own scrobble rather than a manual toggle.
+LIVE_SYNC_RECENT_PLAY_WINDOW_SECS = 600
+# How long pull-sync-applied items stay suppressed from live sync.
+LIVE_SYNC_PULL_APPLIED_SUPPRESS_SECS = 600
+# Library scan finished → wait for Kodi to settle, then pull sync at most
+# once per SCAN_SYNC_MIN_INTERVAL_SECS.
+SCAN_SYNC_DELAY_SECS = 60
+SCAN_SYNC_MIN_INTERVAL_SECS = 30 * 60
+
 REQUEST_TIMEOUT_SECS = 15
 TEST_CONNECTION_TIMEOUT_SECS = 5
 IDENTIFY_REQUEST_TIMEOUT_SECS = 5

@@ -26,6 +26,7 @@ import xbmcgui
 from constants import (
     HEARTBEAT_INTERVAL_SECS,
     HEARTBEAT_MAX_CONSECUTIVE_ERRORS,
+    LIVE_SYNC_RECENT_PLAY_WINDOW_SECS,
     NOTIFICATION_TITLE,
     SCROBBLE_PAUSE_ENDPOINT,
     SCROBBLE_PROGRESS_ENDPOINT,
@@ -108,6 +109,14 @@ class PunchPlayPlayer(xbmc.Player):
         # player callbacks.
         self._rating_lock = threading.Lock()
         self._pending_rating: dict[str, Any] | None = None
+
+        # Library items played recently, as (item_type, dbid, monotonic).
+        # Kodi bumps their playcount when playback finishes; live watched
+        # sync must treat those OnUpdate events as echoes of our own stop
+        # scrobble, not manual toggles.
+        self._library_items_lock = threading.Lock()
+        self._recent_library_items: list[tuple[str, int, float]] = []
+        self._current_library_item: tuple[str, int] | None = None
 
     # ------------------------------------------------------------------
     # Settings helpers
@@ -213,6 +222,39 @@ class PunchPlayPlayer(xbmc.Player):
         if metadata.get("anime"):
             payload["anime"] = True
         return payload
+
+    def _remember_library_item(self, info_tag) -> None:
+        try:
+            dbid = info_tag.getDbId()
+            media_type = (info_tag.getMediaType() or "").lower()
+        except (AttributeError, RuntimeError):
+            return
+        if not isinstance(dbid, int) or dbid <= 0:
+            return
+        if media_type not in ("movie", "episode"):
+            return
+        self._current_library_item = (media_type, dbid)
+        self._stamp_library_item(media_type, dbid)
+
+    def _stamp_library_item(self, media_type: str, dbid: int) -> None:
+        now = time.monotonic()
+        cutoff = now - LIVE_SYNC_RECENT_PLAY_WINDOW_SECS
+        with self._library_items_lock:
+            self._recent_library_items = [
+                item
+                for item in self._recent_library_items
+                if item[2] >= cutoff and (item[0], item[1]) != (media_type, dbid)
+            ]
+            self._recent_library_items.append((media_type, dbid, now))
+
+    def recent_library_items(self) -> list[tuple[str, int, float]]:
+        """Recently played library items — consumed by live watched sync."""
+        cutoff = time.monotonic() - LIVE_SYNC_RECENT_PLAY_WINDOW_SECS
+        with self._library_items_lock:
+            self._recent_library_items = [
+                item for item in self._recent_library_items if item[2] >= cutoff
+            ]
+            return list(self._recent_library_items)
 
     def _capture_position(self) -> tuple[float, float] | None:
         """Read and cache the current Kodi playback position."""
@@ -322,6 +364,10 @@ class PunchPlayPlayer(xbmc.Player):
             path = self.getPlayingFile()
             info_tag = self.getVideoInfoTag()
             duration = self.getTotalTime()
+
+            # Remember the library dbid (if any) before content filters run,
+            # so even untracked plays suppress their playcount echo.
+            self._remember_library_item(info_tag)
 
             # Identify the media.
             from identifier import identify, is_anime
@@ -658,6 +704,11 @@ class PunchPlayPlayer(xbmc.Player):
             self._stop_emitted = True
             self._is_playing = False
             self._stop_heartbeat()
+            # Kodi bumps the item's playcount around now — refresh the echo
+            # suppression window that started when playback began.
+            if self._current_library_item is not None:
+                self._stamp_library_item(*self._current_library_item)
+                self._current_library_item = None
             self._emit_stop(self._settings())
         finally:
             self._metadata = None

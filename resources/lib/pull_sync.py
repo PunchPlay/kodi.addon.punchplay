@@ -213,12 +213,17 @@ def run_pull_sync(
     apply_resume: bool,
     since_ms: int | None = None,
     progress_callback=None,
+    applied_out: set | None = None,
 ) -> dict[str, int]:
     """
     Fetch PunchPlay state and apply it to the Kodi library.
 
     Returns a summary dict:
-      movies_marked / episodes_marked / resume_set / unmatched / already_synced
+      movies_marked / episodes_marked / resume_set / unmatched /
+      already_synced / cancelled
+    When `applied_out` is given, ("movie"|"episode", library_id) tuples are
+    added for every watched state we set — live watched sync uses these to
+    suppress the resulting OnUpdate echoes.
     Raises on fetch failure (callers surface the error).
     """
     path = SCROBBLE_SYNC_ENDPOINT
@@ -267,6 +272,8 @@ def run_pull_sync(
             try:
                 _set_movie_watched(movie, remote_movie)
                 summary["movies_marked"] += 1
+                if applied_out is not None:
+                    applied_out.add(("movie", int(movie["movieid"])))
             except (RuntimeError, KeyError, TypeError, ValueError) as exc:
                 xbmc.log(f"[PunchPlay] Pull sync movie error: {exc}", xbmc.LOGWARNING)
 
@@ -283,6 +290,8 @@ def run_pull_sync(
             try:
                 _set_episode_watched(episode, remote_episode)
                 summary["episodes_marked"] += 1
+                if applied_out is not None:
+                    applied_out.add(("episode", int(episode["episodeid"])))
             except (RuntimeError, KeyError, TypeError, ValueError) as exc:
                 xbmc.log(f"[PunchPlay] Pull sync episode error: {exc}", xbmc.LOGWARNING)
 
@@ -303,6 +312,11 @@ def run_pull_sync(
             try:
                 _set_resume(kodi_item, remote_item)
                 summary["resume_set"] += 1
+                if applied_out is not None:
+                    if "movieid" in kodi_item:
+                        applied_out.add(("movie", int(kodi_item["movieid"])))
+                    else:
+                        applied_out.add(("episode", int(kodi_item["episodeid"])))
             except (RuntimeError, KeyError, TypeError, ValueError) as exc:
                 xbmc.log(f"[PunchPlay] Pull sync resume error: {exc}", xbmc.LOGWARNING)
 

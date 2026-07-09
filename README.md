@@ -4,13 +4,12 @@ PunchPlay is a background service addon that tracks movies and TV episodes you w
 
 It supports Kodi Nexus 20 and Omega 21.
 
-## What's New In 1.4.0
+## What's New In 1.5.0
 
-- Two-way sync: apply PunchPlay watched history and resume points to the Kodi library, with an optional 6-hourly auto-sync.
-- Library import sends per-item playcounts so rewatches are imported instead of collapsing to a single watch.
-- Library import converts Kodi's local `lastplayed` to UTC, fixing timezone-shifted watch dates.
-- Rating prompts no longer block Kodi's player callbacks, and suppressions can be cleared from settings.
-- Heartbeat progress updates survive transient errors; token refresh is race-safe; poison queue entries expire after ~1 day of failed retries.
+- Live watched sync: marking a movie or episode watched in the Kodi library now syncs to PunchPlay within seconds — no library import needed. Un-watching in Kodi never deletes PunchPlay history.
+- Library scans trigger a pull sync (when auto-sync is enabled) so newly added files immediately inherit PunchPlay watched states and resume points.
+
+1.4.0 added two-way sync (PunchPlay watched history and resume points applied to the Kodi library), rewatch playcounts on library import, UTC-correct watch dates, non-blocking rating prompts, and several reliability fixes.
 
 ## Install
 
@@ -51,6 +50,7 @@ The default watched threshold is 90%. Playback only becomes watched when the fin
 - Automatic movie and TV episode scrobbling.
 - Continue-watching progress on PunchPlay.
 - Two-way sync: PunchPlay watched history and resume points applied back to the Kodi library (manual or 6-hourly auto-sync).
+- Live watched sync: manual watched toggles in the Kodi library sync to PunchPlay within seconds.
 - Backend-assisted canonical matching when Kodi metadata is incomplete.
 - Post-watch rating dialog for movies and episodes with suppression options.
 - Preview and import of watched Kodi library items.
@@ -76,6 +76,7 @@ Open **Configure** from the addon details page.
 | Scrobble movies | On | Enables movie tracking. |
 | Scrobble TV shows | On | Enables episode tracking. |
 | Scrobble anime | On | Applies to episodes with the `anime` genre. |
+| Sync Kodi watched changes to PunchPlay | On | Pushes manual watched toggles in the Kodi library to PunchPlay within seconds. |
 | Anime episode format | Auto | `Auto`, `Season/Episode`, or `Absolute episodes` for anime-heavy libraries. |
 | Watched threshold (%) | 90 | Minimum progress needed to log a completed watch. |
 | Minimum file length (minutes) | 5 | Ignores trailers and short clips. |
@@ -144,6 +145,17 @@ The sync reads watched movies and episodes from Kodi's video library using JSON-
 Enable **Auto-sync from PunchPlay every 6 hours** for background incremental syncs (only activity since the previous sync is fetched). The watched and resume halves can be toggled independently.
 
 Items not present in the Kodi library are counted as unmatched and skipped — this sync never adds files or library entries, it only updates watched state and resume points on items Kodi already knows.
+
+## Live Watched Sync (Kodi → PunchPlay)
+
+With **Sync Kodi watched changes to PunchPlay** enabled (default), manually marking a movie or episode watched in the Kodi library logs it on PunchPlay within a few seconds. Bulk operations (marking a whole season watched) are batched into a single request, and duplicates are skipped server-side.
+
+Notes:
+
+- Un-watching an item in Kodi does **not** delete PunchPlay history.
+- Watched changes caused by normal playback or by the pull sync itself are recognised as echoes and skipped — only genuine manual toggles are pushed.
+- The movie/TV/anime scrobble toggles apply here too.
+- When auto-sync is enabled, finishing a library scan also triggers a pull sync (at most every 30 minutes) so newly added files inherit their watched state and resume points.
 
 ## Status And Debug
 

@@ -258,8 +258,9 @@ class RunPullSyncTests(unittest.TestCase):
                     ],
                 }
 
+        applied: set = set()
         summary = pull_sync.run_pull_sync(
-            _FakeAPI(), apply_watched=True, apply_resume=True
+            _FakeAPI(), apply_watched=True, apply_resume=True, applied_out=applied
         )
 
         self.assertEqual(summary["movies_marked"], 1)
@@ -267,6 +268,7 @@ class RunPullSyncTests(unittest.TestCase):
         self.assertEqual(summary["resume_set"], 1)
         self.assertEqual(summary["unmatched"], 1)
         self.assertEqual(summary["already_synced"], 1)
+        self.assertEqual(applied, {("movie", 1), ("episode", 100)})
 
         methods = [method for method, _ in self.rpc_calls]
         self.assertEqual(methods.count("VideoLibrary.SetMovieDetails"), 2)

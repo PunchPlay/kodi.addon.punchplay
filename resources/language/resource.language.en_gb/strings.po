@@ -537,3 +537,7 @@ msgstr ""
 msgctxt "#32133"
 msgid "PunchPlay sync cancelled"
 msgstr ""
+
+msgctxt "#32134"
+msgid "Sync Kodi watched changes to PunchPlay"
+msgstr ""

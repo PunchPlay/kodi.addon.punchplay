@@ -1,3 +1,17 @@
+v1.5.0 (2026-07-10)
+- Live watched sync: manually marking a movie or episode watched in the
+  Kodi library now syncs to PunchPlay within seconds (batched through the
+  import pipeline, so dedup and rewatch playcounts apply). Un-watching in
+  Kodi never deletes PunchPlay history.
+- Echo suppression: playcount changes caused by our own pull sync or by
+  normal playback (already scrobbled at stop) are recognised and skipped,
+  as are library-scan updates.
+- Library scans now trigger a debounced full pull sync (when auto-sync is
+  enabled) so newly added files immediately inherit PunchPlay watched
+  states and resume points.
+- New "Sync Kodi watched changes to PunchPlay" toggle under Scrobbling
+  (on by default); respects the movie/TV/anime scrobble toggles.
+
 v1.4.0 (2026-07-09)
 - Two-way sync: new "Sync From PunchPlay Now" action applies PunchPlay
   watched history (playcount + lastplayed) and resume points to the Kodi

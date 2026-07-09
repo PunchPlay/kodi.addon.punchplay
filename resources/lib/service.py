@@ -41,6 +41,8 @@ from constants import (
     PRUNE_INTERVAL_SECS,
     PULL_SYNC_INTERVAL_SECS,
     PULL_SYNC_OVERLAP_SECS,
+    SCAN_SYNC_DELAY_SECS,
+    SCAN_SYNC_MIN_INTERVAL_SECS,
     SCROBBLE_IMPORT_ENDPOINT,
     get_addon,
     get_profile_dir,
@@ -55,15 +57,19 @@ class PunchPlayService(xbmc.Monitor):
 
         from api import APIClient
         from cache import Cache
+        from library_events import LiveWatchedSync
         from player import PunchPlayPlayer
 
         self._cache = Cache()
         self._api = APIClient(cache=self._cache)
         self._player = PunchPlayPlayer(api=self._api, cache=self._cache)
+        self._live_sync = LiveWatchedSync()
 
         self._last_flush = 0.0
         self._last_prune = 0.0
         self._last_auto_pull_check = 0.0
+        self._scan_sync_due_at: float | None = None
+        self._last_scan_sync = 0.0
 
     # ------------------------------------------------------------------
     # Monitor callbacks
@@ -71,6 +77,19 @@ class PunchPlayService(xbmc.Monitor):
 
     def onSettingsChanged(self) -> None:  # type: ignore[override]
         xbmc.log("[PunchPlay] Settings changed — will apply on next event", xbmc.LOGDEBUG)
+
+    def onNotification(self, sender: str, method: str, data: str) -> None:  # type: ignore[override]
+        # Runs on Kodi's announce thread — queue only, no I/O or dialogs.
+        _ = sender
+        try:
+            if method == "VideoLibrary.OnScanFinished":
+                self._scan_sync_due_at = time.monotonic() + SCAN_SYNC_DELAY_SECS
+                xbmc.log("[PunchPlay] Library scan finished — pull sync queued", xbmc.LOGDEBUG)
+                return
+            if method == "VideoLibrary.OnUpdate" and self._live_sync_enabled():
+                self._live_sync.push_update(data)
+        except Exception as exc:
+            xbmc.log(f"[PunchPlay] Notification handling error: {exc}", xbmc.LOGDEBUG)
 
     # ------------------------------------------------------------------
     # Main loop
@@ -178,6 +197,21 @@ class PunchPlayService(xbmc.Monitor):
                     self._player.prompt_for_rating(rating_request)
                 except Exception as exc:
                     xbmc.log(f"[PunchPlay] Rating prompt error: {exc}", xbmc.LOGWARNING)
+
+            # Push manual Kodi watched toggles to PunchPlay.
+            try:
+                self._push_watched_toggles()
+            except Exception as exc:
+                xbmc.log(f"[PunchPlay] Live watched sync error: {exc}", xbmc.LOGWARNING)
+
+            # Library scan finished → pull sync so new items inherit
+            # watched states and resume points.
+            if self._scan_sync_due_at is not None and now >= self._scan_sync_due_at:
+                self._scan_sync_due_at = None
+                try:
+                    self._maybe_scan_pull_sync(now)
+                except Exception as exc:
+                    xbmc.log(f"[PunchPlay] Scan pull sync error: {exc}", xbmc.LOGWARNING)
 
             # Periodic PunchPlay → Kodi sync when enabled.
             if now - self._last_auto_pull_check >= AUTO_PULL_CHECK_INTERVAL_SECS:
@@ -325,6 +359,83 @@ class PunchPlayService(xbmc.Monitor):
         )
 
     # ------------------------------------------------------------------
+    # Live watched sync (Kodi → PunchPlay)
+    # ------------------------------------------------------------------
+
+    def _live_sync_enabled(self) -> bool:
+        return get_addon().getSettingBool("live_watched_sync")
+
+    def _push_watched_toggles(self) -> None:
+        if self._live_sync.pending_count() == 0:
+            return
+        if not self._api.is_authenticated():
+            self._live_sync.clear()
+            return
+
+        events = self._live_sync.pop_due_events(self._player.recent_library_items())
+        if not events:
+            return
+
+        from library_events import build_import_entry
+
+        addon = get_addon()
+        scrobble_settings = {
+            "movie": addon.getSettingBool("scrobble_movies"),
+            "episode": addon.getSettingBool("scrobble_tv"),
+            "anime": addon.getSettingBool("scrobble_anime"),
+        }
+
+        entries = []
+        for event in events:
+            entry = build_import_entry(event)
+            if entry is None or not entry.get("title"):
+                continue
+            content_key = "anime" if entry.get("anime") else entry["media_type"]
+            if not scrobble_settings.get(content_key, True):
+                xbmc.log(
+                    f"[PunchPlay] Watched toggle skipped — {content_key} scrobbling disabled",
+                    xbmc.LOGDEBUG,
+                )
+                continue
+            entries.append(entry)
+
+        if not entries:
+            return
+
+        xbmc.log(
+            f"[PunchPlay] Pushing {len(entries)} watched toggle(s) to PunchPlay",
+            xbmc.LOGINFO,
+        )
+        resp = self._api.post(SCROBBLE_IMPORT_ENDPOINT, {"entries": entries})
+        if resp is not None:
+            xbmc.log(
+                "[PunchPlay] Watched toggle import: {0} imported, {1} duplicate(s), "
+                "{2} unmatched".format(
+                    resp.get("imported", 0),
+                    resp.get("skipped_duplicates", 0),
+                    resp.get("unmatched", 0),
+                ),
+                xbmc.LOGINFO,
+            )
+
+    def _maybe_scan_pull_sync(self, now: float) -> None:
+        settings = self._pull_sync_settings()
+        if not settings["auto"]:
+            return
+        if not (settings["watched"] or settings["resume"]):
+            return
+        if not self._api.is_authenticated():
+            return
+        if now - self._last_scan_sync < SCAN_SYNC_MIN_INTERVAL_SECS:
+            xbmc.log("[PunchPlay] Scan pull sync skipped (ran recently)", xbmc.LOGDEBUG)
+            return
+        self._last_scan_sync = now
+        # Full sync, not incremental — a scan may have added files whose
+        # watched history on PunchPlay is arbitrarily old.
+        xbmc.log("[PunchPlay] Scan-triggered pull sync starting", xbmc.LOGINFO)
+        self._pull_sync(manual=False)
+
+    # ------------------------------------------------------------------
     # PunchPlay → Kodi sync (pull)
     # ------------------------------------------------------------------
 
@@ -390,6 +501,7 @@ class PunchPlayService(xbmc.Monitor):
             )
             return True
 
+        applied: set = set()
         try:
             summary = run_pull_sync(
                 self._api,
@@ -397,6 +509,7 @@ class PunchPlayService(xbmc.Monitor):
                 apply_resume=settings["resume"],
                 since_ms=since_ms,
                 progress_callback=_progress_callback,
+                applied_out=applied,
             )
         except Exception as exc:
             if progress is not None:
@@ -411,6 +524,11 @@ class PunchPlayService(xbmc.Monitor):
 
         if progress is not None:
             progress.close()
+
+        # Everything we just wrote will echo back as VideoLibrary.OnUpdate —
+        # tell live watched sync those are not manual toggles.
+        if applied:
+            self._live_sync.record_pull_applied(applied)
 
         marked = summary["movies_marked"] + summary["episodes_marked"]
         summary_text = (

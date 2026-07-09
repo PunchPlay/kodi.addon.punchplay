@@ -12,6 +12,7 @@
     <setting id="scrobble_movies"        type="bool"   label="32038"  default="true"/>
     <setting id="scrobble_tv"            type="bool"   label="32039"  default="true"/>
     <setting id="scrobble_anime"         type="bool"   label="32040"  default="true"/>
+    <setting id="live_watched_sync"      type="bool"   label="32134"  default="true"/>
     <setting id="anime_episode_format"   type="enum" label="32090" lvalues="32091|32111|32112" default="0"/>
     <setting id="watched_threshold"      type="slider" label="32043"  default="90" range="50,5,95" option="int"/>
     <setting id="min_length"             type="number" label="32044"  default="5"/>
