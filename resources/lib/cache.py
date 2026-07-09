@@ -19,6 +19,7 @@ import xbmc
 
 from constants import (
     IDENTIFIER_CACHE_TTL_SECS,
+    MAX_QUEUE_ATTEMPTS,
     OFFLINE_QUEUE_MAX_ITEMS,
     QUEUE_ENTRY_MAX_AGE_SECS,
     SCROBBLE_PROGRESS_ENDPOINT,
@@ -74,7 +75,9 @@ class Cache:
                     last_identify_at           INTEGER,
                     last_identify_status       TEXT,
                     last_identify_title        TEXT,
-                    last_identify_confidence   REAL
+                    last_identify_confidence   REAL,
+                    last_pull_sync_at          INTEGER,
+                    last_pull_sync_summary     TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS rating_suppressions (
@@ -135,6 +138,8 @@ class Cache:
             ("last_identify_status", "TEXT"),
             ("last_identify_title", "TEXT"),
             ("last_identify_confidence", "REAL"),
+            ("last_pull_sync_at", "INTEGER"),
+            ("last_pull_sync_summary", "TEXT"),
         ):
             if column_name not in existing_columns:
                 if not column_name.replace("_", "").isalnum():
@@ -154,7 +159,12 @@ class Cache:
             "DELETE FROM pending_scrobbles WHERE created_at < ?",
             (cutoff,),
         )
-        return max(cur.rowcount or 0, 0)
+        dropped = max(cur.rowcount or 0, 0)
+        cur = conn.execute(
+            "DELETE FROM pending_scrobbles WHERE attempt_count >= ?",
+            (MAX_QUEUE_ATTEMPTS,),
+        )
+        return dropped + max(cur.rowcount or 0, 0)
 
     def _drop_one_low_value_pending_scrobble_locked(
         self,
@@ -425,6 +435,11 @@ class Cache:
             ).fetchone()
         return bool(row)
 
+    def clear_rating_suppressions(self) -> int:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM rating_suppressions")
+        return max(cur.rowcount or 0, 0)
+
     # ------------------------------------------------------------------
     # Runtime status
     # ------------------------------------------------------------------
@@ -443,7 +458,9 @@ class Cache:
                     last_identify_at,
                     last_identify_status,
                     last_identify_title,
-                    last_identify_confidence
+                    last_identify_confidence,
+                    last_pull_sync_at,
+                    last_pull_sync_summary
                 FROM runtime_status
                 WHERE singleton = 1
                 """
@@ -461,6 +478,8 @@ class Cache:
             "last_identify_status": row[7],
             "last_identify_title": row[8],
             "last_identify_confidence": row[9],
+            "last_pull_sync_at": row[10],
+            "last_pull_sync_summary": row[11],
         }
 
     def set_account_username(self, username: str | None) -> None:
@@ -493,6 +512,18 @@ class Cache:
                 WHERE singleton = 1
                 """,
                 (int(time.time() * 1000), error[:500]),
+            )
+
+    def record_pull_sync(self, summary: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE runtime_status
+                SET last_pull_sync_at = ?,
+                    last_pull_sync_summary = ?
+                WHERE singleton = 1
+                """,
+                (int(time.time() * 1000), summary[:300]),
             )
 
     def record_identify_result(

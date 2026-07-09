@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <addon id="script.punchplay"
        name="PunchPlay"
-       version="1.3.0"
+       version="1.4.0"
        provider-name="PunchPlay">
 
   <requires>
@@ -22,7 +22,7 @@
     <forum/>
     <website>https://punchplay.tv</website>
     <source>https://github.com/PunchPlay/kodi.addon.punchplay</source>
-    <news>1.3.0 - Add backend identify fallback, stronger movie/TV/anime parsing, library import preview, rating suppression options, stricter backend URL validation, and broader tests/docs</news>
+    <news>1.4.0 - Two-way sync: apply PunchPlay watched history and resume points to the Kodi library, with optional 6-hourly auto-sync. Rewatch playcounts on library import, non-blocking rating prompts, token refresh hardening, and UTC-correct watch dates.</news>
     <assets>
       <icon>icon.png</icon>
       <fanart>fanart.jpg</fanart>

@@ -143,6 +143,11 @@ class APIClient:
         self._tokens: dict[str, str] = self._load_tokens()
         self.device_id: str = self._get_or_create_device_id()
 
+        # Guards _do_refresh: the heartbeat thread and the service thread can
+        # both hit a 401 at the same time, and concurrent refreshes with a
+        # rotating refresh token would log the device out.
+        self._refresh_lock = threading.Lock()
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -462,9 +467,17 @@ class APIClient:
     # ------------------------------------------------------------------
 
     def _do_refresh(self) -> bool:
-        refresh_token = self._tokens.get("refresh_token")
-        if not refresh_token:
+        token_at_entry = self._tokens.get("refresh_token")
+        if not token_at_entry:
             return False
+        with self._refresh_lock:
+            refresh_token = self._tokens.get("refresh_token")
+            if refresh_token != token_at_entry:
+                # Another thread refreshed while we waited on the lock.
+                return bool(self._tokens.get("access_token"))
+            return self._do_refresh_locked(refresh_token)
+
+    def _do_refresh_locked(self, refresh_token: str) -> bool:
         try:
             url = f"{self._base_url()}{AUTH_REFRESH_ENDPOINT}"
             body = json.dumps({"refresh_token": refresh_token}).encode("utf-8")
@@ -561,6 +574,10 @@ class APIClient:
         result = self._request("POST", path, payload, timeout=timeout)
         self._record_success(path, payload)
         return result
+
+    def get(self, path: str, timeout: int = REQUEST_TIMEOUT_SECS) -> dict[str, Any]:
+        """GET *path*.  Raises on failure — no offline queue fallback."""
+        return self._request("GET", path, timeout=timeout)
 
     # ------------------------------------------------------------------
     # Offline queue flush
@@ -1075,6 +1092,8 @@ class APIClient:
             "last_identify_status": runtime_status.get("last_identify_status"),
             "last_identify_title": runtime_status.get("last_identify_title"),
             "last_identify_confidence": runtime_status.get("last_identify_confidence"),
+            "last_pull_sync_at": runtime_status.get("last_pull_sync_at"),
+            "last_pull_sync_summary": runtime_status.get("last_pull_sync_summary"),
             "identifier_cache_size": identifier_cache_size,
             "addon_version": self._client_version,
             "kodi_version": xbmc.getInfoLabel("System.BuildVersion") or localize(32071),

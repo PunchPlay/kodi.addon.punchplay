@@ -1,3 +1,27 @@
+v1.4.0 (2026-07-09)
+- Two-way sync: new "Sync From PunchPlay Now" action applies PunchPlay
+  watched history (playcount + lastplayed) and resume points to the Kodi
+  library, matched by TMDB/IMDb ids. Never un-watches local items and only
+  overwrites local resume points when the PunchPlay progress is newer.
+- Optional auto-sync from PunchPlay every 6 hours (incremental, off by
+  default).
+- Library import now sends per-item playcounts so rewatches are imported
+  (capped, recorded as date-unknown watches) instead of collapsing to a
+  single watch.
+- Library import converts Kodi's local-time lastplayed to UTC before upload,
+  fixing watch dates shifted by the device timezone.
+- Rating prompts no longer block Kodi's player callbacks: the prompt is
+  queued and shown by the service loop after the configured delay.
+- Heartbeat progress updates survive transient errors instead of stopping
+  for the rest of playback (stops only after 3 consecutive failures).
+- Token refresh is now serialized behind a lock so concurrent 401s from the
+  heartbeat and service threads cannot race a rotating refresh token.
+- Offline queue entries are dropped after ~1 day of continuous failed
+  retries (previously retried for up to 30 days).
+- New "Clear Rating Prompt Suppressions" action undoes "Never for this
+  title/show" choices.
+- Rating dialog footer text is now localizable.
+
 v1.3.0 (2026-05-23)
 - Add backend-assisted `/api/identify` matching for items without reliable
   Kodi IDs, with confidence thresholds, safe fallback behavior, and local

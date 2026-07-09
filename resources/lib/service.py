@@ -22,23 +22,29 @@ import xbmcgui
 
 from constants import (
     ACTION_PROPERTY_CLEAR_QUEUE,
+    ACTION_PROPERTY_CLEAR_SUPPRESSIONS,
     ACTION_PROPERTY_EXPORT_DEBUG,
     ACTION_PROPERTY_EXPORT_VERBOSE_DEBUG,
     ACTION_PROPERTY_LOGIN,
     ACTION_PROPERTY_LOGOUT,
     ACTION_PROPERTY_PREVIEW_LIBRARY,
+    ACTION_PROPERTY_PULL_SYNC,
     ACTION_PROPERTY_SHOW_STATUS,
     ACTION_PROPERTY_SYNC_LIBRARY,
     ACTION_PROPERTY_TEST_CONNECTION,
     ADDON_NAME,
+    AUTO_PULL_CHECK_INTERVAL_SECS,
     FLUSH_INTERVAL_SECS,
     HOME_WINDOW_ID,
     LIBRARY_SYNC_BATCH_SIZE,
     NOTIFICATION_TITLE,
     PRUNE_INTERVAL_SECS,
+    PULL_SYNC_INTERVAL_SECS,
+    PULL_SYNC_OVERLAP_SECS,
     SCROBBLE_IMPORT_ENDPOINT,
     get_addon,
     get_profile_dir,
+    kodi_datetime_to_utc_iso,
     localize,
 )
 
@@ -57,6 +63,7 @@ class PunchPlayService(xbmc.Monitor):
 
         self._last_flush = 0.0
         self._last_prune = 0.0
+        self._last_auto_pull_check = 0.0
 
     # ------------------------------------------------------------------
     # Monitor callbacks
@@ -135,6 +142,15 @@ class PunchPlayService(xbmc.Monitor):
                 home_window.clearProperty(ACTION_PROPERTY_CLEAR_QUEUE)
                 self._clear_offline_queue()
 
+            if home_window.getProperty(ACTION_PROPERTY_CLEAR_SUPPRESSIONS):
+                home_window.clearProperty(ACTION_PROPERTY_CLEAR_SUPPRESSIONS)
+                self._clear_rating_suppressions()
+
+            if home_window.getProperty(ACTION_PROPERTY_PULL_SYNC):
+                home_window.clearProperty(ACTION_PROPERTY_PULL_SYNC)
+                xbmc.log("[PunchPlay] Pull sync triggered from settings", xbmc.LOGINFO)
+                self._pull_sync(manual=True)
+
             if home_window.getProperty(ACTION_PROPERTY_PREVIEW_LIBRARY):
                 home_window.clearProperty(ACTION_PROPERTY_PREVIEW_LIBRARY)
                 xbmc.log("[PunchPlay] Library preview triggered from settings", xbmc.LOGINFO)
@@ -153,6 +169,23 @@ class PunchPlayService(xbmc.Monitor):
                     xbmc.log(f"[PunchPlay] Queue flush error: {exc}", xbmc.LOGWARNING)
                 else:
                     self._last_flush = now
+
+            # Show a queued rating prompt once its delay has elapsed.  The
+            # player queues these instead of blocking its callback thread.
+            rating_request = self._player.pop_due_rating_prompt()
+            if rating_request is not None:
+                try:
+                    self._player.prompt_for_rating(rating_request)
+                except Exception as exc:
+                    xbmc.log(f"[PunchPlay] Rating prompt error: {exc}", xbmc.LOGWARNING)
+
+            # Periodic PunchPlay → Kodi sync when enabled.
+            if now - self._last_auto_pull_check >= AUTO_PULL_CHECK_INTERVAL_SECS:
+                self._last_auto_pull_check = now
+                try:
+                    self._maybe_auto_pull_sync()
+                except Exception as exc:
+                    xbmc.log(f"[PunchPlay] Auto pull sync error: {exc}", xbmc.LOGWARNING)
 
             # Prune stale identifier cache entries once a day.
             if now - self._last_prune >= PRUNE_INTERVAL_SECS:
@@ -181,6 +214,17 @@ class PunchPlayService(xbmc.Monitor):
         if age_secs < 86400:
             return _s(32082).format(max(1, age_secs // 3600))
         return _s(32083).format(max(1, age_secs // 86400))
+
+    def _format_pull_sync_status(self, snapshot: dict[str, Any]) -> str:
+        last_at = snapshot.get("last_pull_sync_at")
+        if not last_at:
+            return localize(32070)
+        age_secs = max(0, int(time.time() - int(last_at) / 1000))
+        text = self._format_relative_age(age_secs)
+        summary = snapshot.get("last_pull_sync_summary")
+        if summary:
+            text = f"{text} — {summary}"
+        return text
 
     def _show_status(self) -> None:
         snapshot = self._api.get_status_snapshot()
@@ -214,6 +258,7 @@ class PunchPlayService(xbmc.Monitor):
             _s(32103).format(last_identify),
             _s(32066).format(last_success),
             _s(32067).format(last_error),
+            _s(32127).format(self._format_pull_sync_status(snapshot)),
             _s(32068).format(snapshot.get("addon_version") or _s(32071)),
             _s(32069).format(snapshot.get("kodi_version") or _s(32071)),
         ]
@@ -267,6 +312,145 @@ class PunchPlayService(xbmc.Monitor):
             xbmcgui.NOTIFICATION_INFO,
             3000,
         )
+
+    def _clear_rating_suppressions(self) -> None:
+        _s = localize
+        cleared = self._cache.clear_rating_suppressions()
+        if cleared <= 0:
+            message = _s(32131)
+        else:
+            message = _s(32130).format(cleared)
+        xbmcgui.Dialog().notification(
+            NOTIFICATION_TITLE, message, xbmcgui.NOTIFICATION_INFO, 3000
+        )
+
+    # ------------------------------------------------------------------
+    # PunchPlay → Kodi sync (pull)
+    # ------------------------------------------------------------------
+
+    def _pull_sync_settings(self) -> dict[str, bool]:
+        addon = get_addon()
+        return {
+            "watched": addon.getSettingBool("pull_watched"),
+            "resume": addon.getSettingBool("pull_resume"),
+            "auto": addon.getSettingBool("pull_sync_auto"),
+        }
+
+    def _maybe_auto_pull_sync(self) -> None:
+        settings = self._pull_sync_settings()
+        if not settings["auto"]:
+            return
+        if not (settings["watched"] or settings["resume"]):
+            return
+        if not self._api.is_authenticated():
+            return
+        last_ms = self._cache.get_runtime_status().get("last_pull_sync_at") or 0
+        now_ms = int(time.time() * 1000)
+        if now_ms - int(last_ms) < PULL_SYNC_INTERVAL_SECS * 1000:
+            return
+        since_ms = None
+        if last_ms:
+            since_ms = max(0, int(last_ms) - PULL_SYNC_OVERLAP_SECS * 1000)
+        xbmc.log("[PunchPlay] Auto pull sync starting", xbmc.LOGINFO)
+        self._pull_sync(manual=False, since_ms=since_ms)
+
+    def _pull_sync(self, *, manual: bool, since_ms: int | None = None) -> None:
+        _s = localize
+
+        if not self._api.is_authenticated():
+            if manual:
+                xbmcgui.Dialog().notification(
+                    NOTIFICATION_TITLE, _s(32032), xbmcgui.NOTIFICATION_WARNING, 4000
+                )
+            return
+
+        settings = self._pull_sync_settings()
+        if not (settings["watched"] or settings["resume"]):
+            if manual:
+                xbmcgui.Dialog().notification(
+                    NOTIFICATION_TITLE, _s(32132), xbmcgui.NOTIFICATION_WARNING, 4000
+                )
+            return
+
+        from pull_sync import run_pull_sync
+
+        progress = None
+        if manual:
+            progress = xbmcgui.DialogProgress()
+            progress.create(_s(32121), _s(32122))
+
+        def _progress_callback(done: int, total: int) -> bool:
+            if progress is None:
+                return not self.abortRequested()
+            if progress.iscanceled():
+                return False
+            progress.update(
+                int(100 * done / max(total, 1)),
+                _s(32123).format(done, total),
+            )
+            return True
+
+        try:
+            summary = run_pull_sync(
+                self._api,
+                apply_watched=settings["watched"],
+                apply_resume=settings["resume"],
+                since_ms=since_ms,
+                progress_callback=_progress_callback,
+            )
+        except Exception as exc:
+            if progress is not None:
+                progress.close()
+            xbmc.log(f"[PunchPlay] Pull sync failed: {exc}", xbmc.LOGWARNING)
+            if manual:
+                xbmcgui.Dialog().notification(
+                    NOTIFICATION_TITLE, _s(32126).format(str(exc)[:80]),
+                    xbmcgui.NOTIFICATION_ERROR, 5000
+                )
+            return
+
+        if progress is not None:
+            progress.close()
+
+        marked = summary["movies_marked"] + summary["episodes_marked"]
+        summary_text = (
+            f"{marked} watched, {summary['resume_set']} resume, "
+            f"{summary['unmatched']} unmatched"
+        )
+
+        if summary.get("cancelled"):
+            # Don't record a cancelled run — the next auto-sync must not
+            # treat the unfinished remainder as already synced.
+            xbmc.log(
+                f"[PunchPlay] Pull sync cancelled after: {summary_text}",
+                xbmc.LOGINFO,
+            )
+            if manual:
+                xbmcgui.Dialog().notification(
+                    NOTIFICATION_TITLE, _s(32133), xbmcgui.NOTIFICATION_INFO, 4000
+                )
+            return
+
+        self._cache.record_pull_sync(summary_text)
+        xbmc.log(f"[PunchPlay] Pull sync finished: {summary_text}", xbmc.LOGINFO)
+
+        changed = marked + summary["resume_set"]
+        if manual:
+            message = (
+                _s(32124).format(marked, summary["resume_set"])
+                if changed
+                else _s(32125)
+            )
+            xbmcgui.Dialog().notification(
+                NOTIFICATION_TITLE, message, xbmcgui.NOTIFICATION_INFO, 5000
+            )
+        elif changed and get_addon().getSettingBool("show_notifications"):
+            xbmcgui.Dialog().notification(
+                NOTIFICATION_TITLE,
+                _s(32124).format(marked, summary["resume_set"]),
+                xbmcgui.NOTIFICATION_INFO,
+                5000,
+            )
 
     def _write_library_diagnostics(
         self,
@@ -495,9 +679,12 @@ class PunchPlayService(xbmc.Monitor):
                     entry["tmdb_id"] = int(tmdb)
                 except (ValueError, TypeError):
                     pass
-            last_played = movie.get("lastplayed", "")
-            if last_played:
-                entry["watched_at"] = last_played
+            watched_at = kodi_datetime_to_utc_iso(movie.get("lastplayed", ""))
+            if watched_at:
+                entry["watched_at"] = watched_at
+            playcount = int(movie.get("playcount") or 0)
+            if playcount > 0:
+                entry["playcount"] = playcount
             results.append(entry)
         return results
 
@@ -538,8 +725,11 @@ class PunchPlayService(xbmc.Monitor):
                     entry["tmdb_id"] = int(tmdb)
                 except (ValueError, TypeError):
                     pass
-            last_played = ep.get("lastplayed", "")
-            if last_played:
-                entry["watched_at"] = last_played
+            watched_at = kodi_datetime_to_utc_iso(ep.get("lastplayed", ""))
+            if watched_at:
+                entry["watched_at"] = watched_at
+            playcount = int(ep.get("playcount") or 0)
+            if playcount > 0:
+                entry["playcount"] = playcount
             results.append(entry)
         return results

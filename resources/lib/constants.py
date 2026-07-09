@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import time
+from datetime import datetime, timezone
+
 import xbmcaddon
 import xbmcvfs
 
@@ -18,6 +21,7 @@ SCROBBLE_RESUME_ENDPOINT = "/api/scrobble/resume"
 SCROBBLE_STOP_ENDPOINT = "/api/scrobble/stop"
 SCROBBLE_RATE_ENDPOINT = "/api/scrobble/rate"
 SCROBBLE_IMPORT_ENDPOINT = "/api/scrobble/import"
+SCROBBLE_SYNC_ENDPOINT = "/api/scrobble/sync"
 
 AUTH_DEVICE_CODE_ENDPOINT = "/api/auth/device/code"
 AUTH_DEVICE_TOKEN_ENDPOINT = "/api/auth/device/token"
@@ -34,6 +38,8 @@ ACTION_PROPERTY_SHOW_STATUS = "punchplay_show_status"
 ACTION_PROPERTY_EXPORT_DEBUG = "punchplay_export_debug"
 ACTION_PROPERTY_EXPORT_VERBOSE_DEBUG = "punchplay_export_verbose_debug"
 ACTION_PROPERTY_CLEAR_QUEUE = "punchplay_clear_queue"
+ACTION_PROPERTY_PULL_SYNC = "punchplay_pull_sync"
+ACTION_PROPERTY_CLEAR_SUPPRESSIONS = "punchplay_clear_suppressions"
 
 HOME_WINDOW_ID = 10000
 
@@ -44,9 +50,18 @@ IDENTIFIER_SUCCESS_CACHE_TTL_SECS = 30 * 24 * 60 * 60
 IDENTIFIER_NO_MATCH_CACHE_TTL_SECS = 24 * 60 * 60
 QUEUE_ENTRY_MAX_AGE_SECS = 30 * 24 * 60 * 60
 OFFLINE_QUEUE_MAX_ITEMS = 500
+# Flush touches at most one failing entry per minute, so this cap (~1 day of
+# continuous failures) drops poison payloads the backend will never accept.
+MAX_QUEUE_ATTEMPTS = 1440
 LIBRARY_SYNC_BATCH_SIZE = 50
 STOP_COMPLETE_GRACE_SECS = 3
 HEARTBEAT_INTERVAL_SECS = 15
+HEARTBEAT_MAX_CONSECUTIVE_ERRORS = 3
+
+PULL_SYNC_INTERVAL_SECS = 6 * 60 * 60
+PULL_SYNC_OVERLAP_SECS = 60 * 60
+PULL_SYNC_TIMEOUT_SECS = 60
+AUTO_PULL_CHECK_INTERVAL_SECS = 60
 
 REQUEST_TIMEOUT_SECS = 15
 TEST_CONNECTION_TIMEOUT_SECS = 5
@@ -82,3 +97,49 @@ def mask_value(value: str, visible: int = 4) -> str:
     if len(value) <= visible * 2:
         return value
     return "{0}…{1}".format(value[:visible], value[-visible:])
+
+
+def kodi_datetime_to_utc_iso(value: str | None) -> str | None:
+    """Convert Kodi's local-time "YYYY-MM-DD HH:MM:SS" to a UTC ISO 8601 string."""
+    if not value:
+        return None
+    try:
+        parsed = time.strptime(value.strip(), "%Y-%m-%d %H:%M:%S")
+        epoch = time.mktime(parsed)  # interprets the struct as local time
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+    except (ValueError, OverflowError):
+        return None
+
+
+def kodi_datetime_to_epoch(value: str | None) -> float | None:
+    """Convert Kodi's local-time "YYYY-MM-DD HH:MM:SS" to a Unix timestamp."""
+    if not value:
+        return None
+    try:
+        return time.mktime(time.strptime(value.strip(), "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def iso_to_epoch(value: str | None) -> float | None:
+    """Parse an ISO 8601 timestamp (with Z or offset) to a Unix timestamp."""
+    if not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def iso_to_kodi_datetime(value: str | None) -> str | None:
+    """Convert an ISO 8601 timestamp to Kodi's local-time "YYYY-MM-DD HH:MM:SS"."""
+    epoch = iso_to_epoch(value)
+    if epoch is None:
+        return None
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))

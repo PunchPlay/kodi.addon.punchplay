@@ -157,6 +157,56 @@ class PlayerHelperTests(unittest.TestCase):
         self.assertIn("event_created_at", payload)
         self.assertEqual(payload["client_version"], "1.3.0")
 
+    def test_rating_prompt_queued_and_popped_when_due(self) -> None:
+        player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=_FakeCache())
+        metadata = {"media_type": "movie", "title": "Inception", "tmdb_id": 27205}
+
+        player._queue_rating_prompt(  # pylint: disable=protected-access
+            metadata, {"rating_prompt_delay": 0}, stop_resp={}
+        )
+        request = player.pop_due_rating_prompt()
+
+        self.assertIsNotNone(request)
+        self.assertEqual(request["metadata"]["title"], "Inception")
+        self.assertIn("title", request["suppression_keys"])
+        # Popping consumed the request.
+        self.assertIsNone(player.pop_due_rating_prompt())
+
+    def test_rating_prompt_not_due_before_delay(self) -> None:
+        player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=_FakeCache())
+        player._queue_rating_prompt(  # pylint: disable=protected-access
+            {"media_type": "movie", "title": "Inception", "tmdb_id": 27205},
+            {"rating_prompt_delay": 60},
+            stop_resp={},
+        )
+
+        self.assertIsNone(player.pop_due_rating_prompt())
+        # Still pending — not consumed by the early poll.
+        self.assertIsNotNone(player._pending_rating)  # pylint: disable=protected-access
+
+    def test_rating_prompt_dropped_when_video_playing(self) -> None:
+        player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=_FakeCache())
+        player.isPlayingVideo = lambda: True  # type: ignore[method-assign]
+        player._queue_rating_prompt(  # pylint: disable=protected-access
+            {"media_type": "movie", "title": "Inception", "tmdb_id": 27205},
+            {"rating_prompt_delay": 0},
+            stop_resp={},
+        )
+
+        self.assertIsNone(player.pop_due_rating_prompt())
+        # Dropped, not deferred — autoplay cancels the prompt.
+        self.assertIsNone(player._pending_rating)  # pylint: disable=protected-access
+
+    def test_rating_prompt_skipped_without_reliable_identity(self) -> None:
+        player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=_FakeCache())
+        player._queue_rating_prompt(  # pylint: disable=protected-access
+            {"media_type": "movie", "title": "Unknown Movie"},
+            {"rating_prompt_delay": 0},
+            stop_resp=None,
+        )
+
+        self.assertIsNone(player._pending_rating)  # pylint: disable=protected-access
+
     def test_duplicate_stop_guard_emits_stop_once(self) -> None:
         player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=_FakeCache())
         calls: list[str] = []

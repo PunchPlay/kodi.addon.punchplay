@@ -132,6 +132,51 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(updated["last_error"], "HTTP 500")
         self.assertIsNotNone(updated["last_attempt_at"])
 
+    def test_queue_drops_entries_after_attempt_cap(self) -> None:
+        cache = cache_module.Cache()
+        cache.enqueue_scrobble(
+            constants.SCROBBLE_PROGRESS_ENDPOINT,
+            {"event_id": "poison"},
+        )
+        cache.enqueue_scrobble(
+            constants.SCROBBLE_STOP_ENDPOINT,
+            {"event_id": "healthy"},
+        )
+        poison_id = int(cache.get_pending_scrobbles()[0]["id"])
+        with cache._connect() as conn:  # pylint: disable=protected-access
+            conn.execute(
+                "UPDATE pending_scrobbles SET attempt_count = ? WHERE id = ?",
+                (constants.MAX_QUEUE_ATTEMPTS, poison_id),
+            )
+
+        dropped = cache.drop_expired_pending_scrobbles()
+
+        self.assertEqual(dropped, 1)
+        event_ids = [
+            item["payload"].get("event_id") for item in cache.get_pending_scrobbles()
+        ]
+        self.assertEqual(event_ids, ["healthy"])
+
+    def test_clear_rating_suppressions_reports_count(self) -> None:
+        cache = cache_module.Cache()
+        cache.set_rating_suppression("title:movie:1", "title")
+        cache.set_rating_suppression("show:2", "show")
+
+        self.assertTrue(cache.has_rating_suppression("title:movie:1"))
+        self.assertEqual(cache.clear_rating_suppressions(), 2)
+        self.assertFalse(cache.has_rating_suppression("title:movie:1"))
+        self.assertEqual(cache.clear_rating_suppressions(), 0)
+
+    def test_record_pull_sync_updates_runtime_status(self) -> None:
+        cache = cache_module.Cache()
+        cache.record_pull_sync("3 watched, 1 resume, 0 unmatched")
+
+        status = cache.get_runtime_status()
+        self.assertEqual(
+            status["last_pull_sync_summary"], "3 watched, 1 resume, 0 unmatched"
+        )
+        self.assertIsNotNone(status["last_pull_sync_at"])
+
     def test_queue_endpoint_summary_counts_entries(self) -> None:
         cache = cache_module.Cache()
         cache.enqueue_scrobble(constants.SCROBBLE_PROGRESS_ENDPOINT, {"event_id": "progress"})

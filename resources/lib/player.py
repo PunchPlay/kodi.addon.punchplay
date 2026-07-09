@@ -25,6 +25,7 @@ import xbmcgui
 
 from constants import (
     HEARTBEAT_INTERVAL_SECS,
+    HEARTBEAT_MAX_CONSECUTIVE_ERRORS,
     NOTIFICATION_TITLE,
     SCROBBLE_PAUSE_ENDPOINT,
     SCROBBLE_PROGRESS_ENDPOINT,
@@ -101,6 +102,12 @@ class PunchPlayPlayer(xbmc.Player):
         # Heartbeat thread management.
         self._hb_thread: threading.Thread | None = None
         self._hb_stop = threading.Event()
+
+        # Pending rating prompt — queued by the player callback thread and
+        # drained by the service loop so modal dialogs never block Kodi's
+        # player callbacks.
+        self._rating_lock = threading.Lock()
+        self._pending_rating: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Settings helpers
@@ -237,6 +244,7 @@ class PunchPlayPlayer(xbmc.Player):
         self._hb_thread = None
 
     def _heartbeat_loop(self) -> None:
+        consecutive_errors = 0
         while not self._hb_stop.is_set():
             settings = self._settings()
             interval = max(1, settings["heartbeat_interval"])
@@ -271,14 +279,26 @@ class PunchPlayPlayer(xbmc.Player):
                     xbmc.LOGDEBUG,
                 )
                 self._api.post(SCROBBLE_PROGRESS_ENDPOINT, payload)
+                consecutive_errors = 0
 
             except Exception as exc:
-                xbmc.log(f"[PunchPlay] Heartbeat error: {exc}", xbmc.LOGWARNING)
-                # Always stop the heartbeat on any unhandled error — avoids
-                # the thread spinning silently if the player enters a bad state.
-                self._hb_stop.set()
-                xbmc.log("[PunchPlay] Heartbeat stopping due to error", xbmc.LOGINFO)
-                return
+                # Tolerate transient errors (a single bad settings read or
+                # position capture) — one hiccup must not silence progress
+                # updates for the rest of playback.  Only stop once the
+                # player looks persistently broken.
+                consecutive_errors += 1
+                xbmc.log(
+                    f"[PunchPlay] Heartbeat error "
+                    f"({consecutive_errors}/{HEARTBEAT_MAX_CONSECUTIVE_ERRORS}): {exc}",
+                    xbmc.LOGWARNING,
+                )
+                if consecutive_errors >= HEARTBEAT_MAX_CONSECUTIVE_ERRORS:
+                    self._hb_stop.set()
+                    xbmc.log(
+                        "[PunchPlay] Heartbeat stopping after repeated errors",
+                        xbmc.LOGINFO,
+                    )
+                    return
 
     # ------------------------------------------------------------------
     # Playback events
@@ -344,6 +364,11 @@ class PunchPlayPlayer(xbmc.Player):
             self._stop_emitted = False
             self._last_position = 0.0
             self._last_duration = 0.0
+
+            # A new tracked playback cancels any not-yet-shown rating prompt
+            # (autoplay of the next episode).
+            with self._rating_lock:
+                self._pending_rating = None
 
             captured = self._capture_position()
             position = captured[0] if captured else 0.0
@@ -456,8 +481,9 @@ class PunchPlayPlayer(xbmc.Player):
                     msg = _s(32013).format(title)
                 self._notify(msg, settings)
 
-                # Offer the rating dialog if enabled and not already playing
-                # something else (e.g. immediate next episode).
+                # Queue the rating prompt for the service loop — never show
+                # modal dialogs from the player callback thread, or Kodi's
+                # subsequent playback callbacks stall behind them.
                 if not settings["rate_after_watching"]:
                     xbmc.log("[PunchPlay] Rating disabled in settings", xbmc.LOGINFO)
                 else:
@@ -466,7 +492,7 @@ class PunchPlayPlayer(xbmc.Player):
                         for key in ("tmdb_id", "tvdb_id", "imdb_id", "punchplay_id"):
                             if stop_resp.get(key) is not None:
                                 merged_metadata[key] = stop_resp[key]
-                    self._maybe_prompt_for_rating(merged_metadata, settings, stop_resp=stop_resp)
+                    self._queue_rating_prompt(merged_metadata, settings, stop_resp=stop_resp)
         except Exception as exc:
             xbmc.log(f"[PunchPlay] Stop emit error: {exc}", xbmc.LOGDEBUG)
 
@@ -474,16 +500,14 @@ class PunchPlayPlayer(xbmc.Player):
     # Rating dialog
     # ------------------------------------------------------------------
 
-    def _maybe_prompt_for_rating(
+    def _queue_rating_prompt(
         self,
         metadata: dict[str, Any],
         settings: dict[str, Any],
         *,
         stop_resp: dict[str, Any] | None,
     ) -> None:
-        if self.isPlayingVideo():
-            xbmc.log("[PunchPlay] Skipping rating — another video is playing", xbmc.LOGINFO)
-            return
+        """Store a pending rating request for the service loop to pick up."""
         if stop_resp is None and not has_reliable_rating_identity(metadata):
             xbmc.log("[PunchPlay] Skipping rating — no reliable canonical ID", xbmc.LOGINFO)
             return
@@ -499,18 +523,35 @@ class PunchPlayPlayer(xbmc.Player):
                 return
 
         delay_secs = max(0, int(settings.get("rating_prompt_delay") or 0))
-        if delay_secs:
-            monitor = xbmc.Monitor()
-            deadline = time.monotonic() + delay_secs
-            while time.monotonic() < deadline:
-                if monitor.abortRequested():
-                    xbmc.log("[PunchPlay] Skipping rating — Kodi is shutting down", xbmc.LOGINFO)
-                    return
-                if self.isPlayingVideo():
-                    xbmc.log("[PunchPlay] Skipping rating — autoplay resumed", xbmc.LOGINFO)
-                    return
-                monitor.waitForAbort(0.25)
+        with self._rating_lock:
+            self._pending_rating = {
+                "metadata": metadata,
+                "suppression_keys": suppression_keys,
+                "not_before": time.monotonic() + delay_secs,
+            }
 
+    def pop_due_rating_prompt(self) -> dict[str, Any] | None:
+        """
+        Return the pending rating request once its delay has elapsed, or None.
+        Called by the service loop.  The delay lets Kodi settle so autoplay
+        of the next episode cancels the prompt instead of being interrupted.
+        """
+        with self._rating_lock:
+            pending = self._pending_rating
+            if pending is None or time.monotonic() < pending["not_before"]:
+                return None
+            self._pending_rating = None
+
+        if self.isPlayingVideo():
+            xbmc.log("[PunchPlay] Skipping rating — another video is playing", xbmc.LOGINFO)
+            return None
+        return pending
+
+    def prompt_for_rating(self, request: dict[str, Any]) -> None:
+        """Show the rating option dialog.  Must be called off the player
+        callback thread (the service loop)."""
+        metadata = request["metadata"]
+        suppression_keys = request["suppression_keys"]
         title = metadata.get("title", "")
         _s = localize
         options = [
@@ -572,6 +613,7 @@ class PunchPlayPlayer(xbmc.Player):
             rate_dlg = RatingDialog(
                 bg_path=bg_path,
                 heading=heading,
+                footer=_s(32128),
                 initial=5,
             )
             rate_dlg.doModal()
@@ -632,3 +674,5 @@ class PunchPlayPlayer(xbmc.Player):
         self._metadata = None
         self._playback_session_id = None
         self._stop_emitted = False
+        with self._rating_lock:
+            self._pending_rating = None
