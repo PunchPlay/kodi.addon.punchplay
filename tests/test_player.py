@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import importlib
 import os
+import queue
 import sys
+import threading
+import time
 import types
 import unittest
 
@@ -221,6 +224,172 @@ class PlayerHelperTests(unittest.TestCase):
         player._handle_stop()  # pylint: disable=protected-access
 
         self.assertEqual(calls, ["stop"])
+
+
+class _RecordingAPI(_FakeAPI):
+    """Records posts, and can be made to block mid-post."""
+
+    def __init__(self, block: threading.Event | None = None) -> None:
+        self.posts: list[tuple[str, dict]] = []
+        self.block = block
+        self.entered = threading.Event()
+        self.stop_response: dict = {}
+
+    def post(self, endpoint, payload):
+        self.entered.set()
+        if self.block is not None:
+            self.block.wait(5)
+        self.posts.append((endpoint, payload))
+        return dict(self.stop_response)
+
+
+def _settings(**overrides):
+    base = {
+        "watched_threshold": 0.7,
+        "rate_after_watching": True,
+        "show_notifications": False,
+        "notify_during_playback": False,
+        "rating_prompt_delay": 0,
+    }
+    base.update(overrides)
+    return base
+
+
+class PostWorkerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_get_addon = player_module.get_addon
+        self.original_get_addon_version = player_module.get_addon_version
+        player_module.get_addon = lambda: _FakeAddon()
+        player_module.get_addon_version = lambda: "1.3.0"
+        self.players: list = []
+
+    def tearDown(self) -> None:
+        for player in self.players:
+            player.cleanup()
+        player_module.get_addon = self.original_get_addon
+        player_module.get_addon_version = self.original_get_addon_version
+
+    def _player(self, api):
+        player = player_module.PunchPlayPlayer(api=api, cache=_FakeCache())
+        self.players.append(player)
+        return player
+
+    def _drain(self, player) -> None:
+        player._post_queue.join()  # pylint: disable=protected-access
+
+    def test_dispatch_does_not_block_the_calling_thread(self) -> None:
+        block = threading.Event()
+        api = _RecordingAPI(block=block)
+        player = self._player(api)
+
+        started = time.monotonic()
+        player._dispatch_post("/api/scrobble/start", {"title": "Inception"})
+        elapsed = time.monotonic() - started
+
+        # The worker is stuck inside post(); the caller must have returned.
+        self.assertTrue(api.entered.wait(5))
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(api.posts, [])
+
+        block.set()
+        self._drain(player)
+        self.assertEqual(len(api.posts), 1)
+
+    def test_events_are_posted_in_order(self) -> None:
+        api = _RecordingAPI()
+        player = self._player(api)
+
+        for endpoint in ("start", "progress", "pause", "resume", "stop"):
+            player._dispatch_post(f"/api/scrobble/{endpoint}", {"n": endpoint})
+        self._drain(player)
+
+        self.assertEqual(
+            [endpoint for endpoint, _ in api.posts],
+            [
+                "/api/scrobble/start",
+                "/api/scrobble/progress",
+                "/api/scrobble/pause",
+                "/api/scrobble/resume",
+                "/api/scrobble/stop",
+            ],
+        )
+
+    def test_emit_stop_returns_before_the_network_call_finishes(self) -> None:
+        block = threading.Event()
+        api = _RecordingAPI(block=block)
+        player = self._player(api)
+        player._metadata = {"media_type": "movie", "title": "Inception"}
+        player._playback_session_id = "session-1"
+
+        started = time.monotonic()
+        player._emit_stop(_settings())
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(api.entered.wait(5))
+        self.assertLess(elapsed, 1.0)
+
+        block.set()
+        self._drain(player)
+        self.assertEqual(api.posts[0][0], player_module.SCROBBLE_STOP_ENDPOINT)
+
+    def test_send_stop_merges_canonical_ids_into_the_rating_prompt(self) -> None:
+        api = _RecordingAPI()
+        api.stop_response = {"tmdb_id": 27205, "punchplay_id": "pp-1"}
+        player = self._player(api)
+
+        player._send_stop(
+            payload={"title": "Inception"},
+            metadata={"media_type": "movie", "title": "Inception"},
+            settings=_settings(),
+            session_id="session-1",
+            watched=True,
+        )
+
+        request = player.pop_due_rating_prompt()
+        self.assertIsNotNone(request)
+        self.assertEqual(request["metadata"]["tmdb_id"], 27205)
+        self.assertEqual(request["metadata"]["punchplay_id"], "pp-1")
+
+    def test_send_stop_skips_rating_when_not_watched(self) -> None:
+        api = _RecordingAPI()
+        player = self._player(api)
+
+        player._send_stop(
+            payload={"title": "Inception"},
+            metadata={"media_type": "movie", "title": "Inception", "tmdb_id": 1},
+            settings=_settings(),
+            session_id=None,
+            watched=False,
+        )
+
+        self.assertIsNone(player._pending_rating)
+
+    def test_full_queue_drops_instead_of_blocking(self) -> None:
+        block = threading.Event()
+        api = _RecordingAPI(block=block)
+        player = self._player(api)
+        # Shrink the queue so the test does not need 100 events.
+        player._post_queue = queue.Queue(maxsize=1)
+
+        # One event occupies the worker, one fills the queue, the third has
+        # nowhere to go and must be dropped rather than stall the caller.
+        for i in range(3):
+            player._dispatch_post("/api/scrobble/progress", {"n": i})
+
+        self.assertTrue(api.entered.wait(5))
+        block.set()
+        self._drain(player)
+        self.assertLessEqual(len(api.posts), 2)
+
+    def test_cleanup_drains_queued_posts(self) -> None:
+        api = _RecordingAPI()
+        player = player_module.PunchPlayPlayer(api=api, cache=_FakeCache())
+
+        player._dispatch_post("/api/scrobble/stop", {"title": "Inception"})
+        player.cleanup()
+
+        # cleanup() joins the worker, so the stop event is already sent.
+        self.assertEqual(len(api.posts), 1)
 
 
 if __name__ == "__main__":

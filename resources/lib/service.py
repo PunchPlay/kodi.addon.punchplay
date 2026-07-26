@@ -37,6 +37,7 @@ from constants import (
     FLUSH_INTERVAL_SECS,
     HOME_WINDOW_ID,
     LIBRARY_SYNC_BATCH_SIZE,
+    LIBRARY_SYNC_MAX_CONSECUTIVE_FAILURES,
     NOTIFICATION_TITLE,
     PRUNE_INTERVAL_SECS,
     PULL_SYNC_INTERVAL_SECS,
@@ -588,6 +589,78 @@ class PunchPlayService(xbmc.Monitor):
     # Kodi library sync
     # ------------------------------------------------------------------
 
+    def _post_library_batches(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        endpoint: str,
+        dry_run: bool,
+        progress: Any,
+        progress_base: int,
+        progress_span: int,
+        message_id: int,
+        totals: dict[str, int],
+        diagnostics: list[dict[str, Any]],
+    ) -> str:
+        """
+        POST *entries* in batches, accumulating counts into *totals*.
+
+        Returns "done", "cancelled", or "failed".  A failed batch is counted
+        and retried on the next run rather than silently forgotten; after
+        LIBRARY_SYNC_MAX_CONSECUTIVE_FAILURES in a row we stop, because the
+        rest of the run would only pile up more of the same error.
+        """
+        _s = localize
+        total = len(entries)
+        consecutive_failures = 0
+
+        for start in range(0, total, LIBRARY_SYNC_BATCH_SIZE):
+            if progress.iscanceled():
+                return "cancelled"
+
+            batch = entries[start : start + LIBRARY_SYNC_BATCH_SIZE]
+            done = min(start + LIBRARY_SYNC_BATCH_SIZE, total)
+            progress.update(
+                progress_base + int(progress_span * done / max(total, 1)),
+                _s(message_id).format(done, total),
+            )
+
+            try:
+                resp = self._api.post_immediate(
+                    endpoint,
+                    {"entries": batch},
+                    timeout=55,
+                )
+            except Exception as exc:
+                # A preview exists to surface problems — fail loudly.
+                if dry_run:
+                    raise RuntimeError(_s(32116).format(str(exc)[:80])) from exc
+                consecutive_failures += 1
+                totals["failed_batches"] += 1
+                totals["not_sent"] += len(batch)
+                xbmc.log(
+                    f"[PunchPlay] Library batch failed "
+                    f"({consecutive_failures}/{LIBRARY_SYNC_MAX_CONSECUTIVE_FAILURES}): {exc}",
+                    xbmc.LOGWARNING,
+                )
+                if consecutive_failures >= LIBRARY_SYNC_MAX_CONSECUTIVE_FAILURES:
+                    totals["not_sent"] += total - done
+                    xbmc.log(
+                        "[PunchPlay] Library sync aborted after repeated batch failures",
+                        xbmc.LOGWARNING,
+                    )
+                    return "failed"
+                continue
+
+            consecutive_failures = 0
+            totals["imported"] += resp.get("would_import", resp.get("imported", 0))
+            totals["skipped_duplicates"] += resp.get("skipped_duplicates", 0)
+            totals["unmatched"] += resp.get("unmatched", 0)
+            totals["rejected_items"] += resp.get("failed", 0)
+            diagnostics.extend(resp.get("items", []) or [])
+
+        return "done"
+
     def _sync_kodi_library(self, dry_run: bool = False) -> None:
         """Import all watched items from the Kodi library into PunchPlay."""
         _s = localize
@@ -615,13 +688,14 @@ class PunchPlayService(xbmc.Monitor):
                 )
                 return
 
-            total_movies = len(movies)
-            total_episodes = len(episodes)
-            importable_movies = 0
-            importable_episodes = 0
-            skipped_duplicates = 0
-            unmatched = 0
-            failed = 0
+            totals = {
+                "imported": 0,
+                "skipped_duplicates": 0,
+                "unmatched": 0,
+                "rejected_items": 0,
+                "failed_batches": 0,
+                "not_sent": 0,
+            }
             diagnostics: list[dict[str, Any]] = []
             endpoint = (
                 SCROBBLE_IMPORT_ENDPOINT + "?dry_run=true"
@@ -629,75 +703,37 @@ class PunchPlayService(xbmc.Monitor):
                 else SCROBBLE_IMPORT_ENDPOINT
             )
 
-            # ── Sync movies in batches of 50 ────────────────────────────
-            cancelled = False
-            for i in range(0, total_movies, LIBRARY_SYNC_BATCH_SIZE):
-                if progress.iscanceled():
-                    cancelled = True
-                    break
-                batch = movies[i : i + LIBRARY_SYNC_BATCH_SIZE]
-                progress.update(
-                    int(50 * min(i + LIBRARY_SYNC_BATCH_SIZE, total_movies) / max(total_movies, 1)),
-                    _s(32025).format(
-                        min(i + LIBRARY_SYNC_BATCH_SIZE, total_movies), total_movies
-                    ),
+            outcome = self._post_library_batches(
+                movies,
+                endpoint=endpoint,
+                dry_run=dry_run,
+                progress=progress,
+                progress_base=0,
+                progress_span=50,
+                message_id=32025,
+                totals=totals,
+                diagnostics=diagnostics,
+            )
+            if outcome == "done":
+                outcome = self._post_library_batches(
+                    episodes,
+                    endpoint=endpoint,
+                    dry_run=dry_run,
+                    progress=progress,
+                    progress_base=50,
+                    progress_span=50,
+                    message_id=32026,
+                    totals=totals,
+                    diagnostics=diagnostics,
                 )
-                try:
-                    resp = self._api.post_immediate(
-                        endpoint,
-                        {"entries": batch},
-                        timeout=55,
-                    )
-                    importable_movies += resp.get("would_import", resp.get("imported", 0))
-                    skipped_duplicates += resp.get("skipped_duplicates", 0)
-                    unmatched += resp.get("unmatched", 0)
-                    failed += resp.get("failed", 0)
-                    diagnostics.extend(resp.get("items", []) or [])
-                except Exception as exc:
-                    if dry_run:
-                        raise RuntimeError(_s(32116).format(str(exc)[:80])) from exc
-                    xbmc.log(f"[PunchPlay] Movie batch error: {exc}", xbmc.LOGWARNING)
-
-            # ── Sync episodes in batches of 50 ──────────────────────────
-            if not cancelled:
-                for i in range(0, total_episodes, LIBRARY_SYNC_BATCH_SIZE):
-                    if progress.iscanceled():
-                        cancelled = True
-                        break
-                    batch = episodes[i : i + LIBRARY_SYNC_BATCH_SIZE]
-                    pct = 50 + int(
-                        50
-                        * min(i + LIBRARY_SYNC_BATCH_SIZE, total_episodes)
-                        / max(total_episodes, 1)
-                    )
-                    progress.update(
-                        pct,
-                        _s(32026).format(
-                            min(i + LIBRARY_SYNC_BATCH_SIZE, total_episodes),
-                            total_episodes,
-                        ),
-                    )
-                    try:
-                        resp = self._api.post_immediate(
-                            endpoint,
-                            {"entries": batch},
-                            timeout=55,
-                        )
-                        importable_episodes += resp.get("would_import", resp.get("imported", 0))
-                        skipped_duplicates += resp.get("skipped_duplicates", 0)
-                        unmatched += resp.get("unmatched", 0)
-                        failed += resp.get("failed", 0)
-                        diagnostics.extend(resp.get("items", []) or [])
-                    except Exception as exc:
-                        if dry_run:
-                            raise RuntimeError(_s(32116).format(str(exc)[:80])) from exc
-                        xbmc.log(f"[PunchPlay] Episode batch error: {exc}", xbmc.LOGWARNING)
+            elif outcome == "failed":
+                totals["not_sent"] += len(episodes)
 
             progress.close()
-            if cancelled:
+            if outcome == "cancelled":
                 xbmc.log(
-                    f"[PunchPlay] Library sync cancelled. "
-                    f"Processed {importable_movies} movies, {importable_episodes} episodes before cancel.",
+                    f"[PunchPlay] Library sync cancelled after importing "
+                    f"{totals['imported']} item(s).",
                     xbmc.LOGINFO,
                 )
             else:
@@ -707,45 +743,52 @@ class PunchPlayService(xbmc.Monitor):
                         "library-import-preview.json" if dry_run else "library-import-diagnostics.json",
                         {
                             "dry_run": dry_run,
-                            "movies": total_movies,
-                            "episodes": total_episodes,
-                            "would_import" if dry_run else "imported": (
-                                importable_movies + importable_episodes
-                            ),
-                            "skipped_duplicates": skipped_duplicates,
-                            "unmatched": unmatched,
-                            "failed": failed,
+                            "movies": len(movies),
+                            "episodes": len(episodes),
+                            "would_import" if dry_run else "imported": totals["imported"],
+                            "skipped_duplicates": totals["skipped_duplicates"],
+                            "unmatched": totals["unmatched"],
+                            "failed": totals["rejected_items"],
+                            "failed_batches": totals["failed_batches"],
+                            "not_sent": totals["not_sent"],
                             "items": diagnostics,
                         },
                     )
 
                 if dry_run:
                     msg = _s(32107).format(
-                        importable_movies + importable_episodes,
-                        skipped_duplicates,
-                        unmatched,
+                        totals["imported"],
+                        totals["skipped_duplicates"],
+                        totals["unmatched"],
                     )
+                    icon = xbmcgui.NOTIFICATION_INFO
+                elif totals["not_sent"]:
+                    # Some entries never reached the backend — say so rather
+                    # than reporting a total that quietly excludes them.
+                    msg = _s(32135).format(totals["imported"], totals["not_sent"])
+                    icon = xbmcgui.NOTIFICATION_WARNING
                 else:
                     msg = _s(32027).format(
-                        importable_movies + importable_episodes,
-                        skipped_duplicates,
-                        unmatched,
+                        totals["imported"],
+                        totals["skipped_duplicates"],
+                        totals["unmatched"],
                     )
-                if failed:
+                    icon = xbmcgui.NOTIFICATION_INFO
+
+                if totals["rejected_items"]:
                     xbmc.log(
-                        f"[PunchPlay] Library sync finished with {failed} failed item(s)",
+                        f"[PunchPlay] Library sync: backend rejected "
+                        f"{totals['rejected_items']} item(s)",
                         xbmc.LOGWARNING,
                     )
-                xbmcgui.Dialog().notification(
-                    NOTIFICATION_TITLE, msg, xbmcgui.NOTIFICATION_INFO, 6000
-                )
+                xbmcgui.Dialog().notification(NOTIFICATION_TITLE, msg, icon, 6000)
                 xbmc.log(f"[PunchPlay] Library sync: {msg}", xbmc.LOGINFO)
                 if diagnostics_path:
                     xbmc.log(
                         f"[PunchPlay] Library diagnostics written to {diagnostics_path}",
                         xbmc.LOGINFO,
                     )
-                if dry_run and (importable_movies + importable_episodes) > 0:
+                if dry_run and totals["imported"] > 0:
                     if xbmcgui.Dialog().yesno(ADDON_NAME, _s(32108)):
                         self._sync_kodi_library(dry_run=False)
 

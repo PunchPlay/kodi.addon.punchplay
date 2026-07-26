@@ -1,3 +1,26 @@
+v1.5.1 (2026-07-26)
+- Library sync no longer claims success when batches failed. Entries that
+  never reached PunchPlay are counted and reported so the run can be
+  repeated, instead of being dropped from the total.
+- Library sync now stops after three consecutive failed batches rather than
+  grinding through the rest of the library against an unreachable backend.
+- Import batches raised from 50 to 100 entries (the backend maximum),
+  halving the number of requests a full library sync needs.
+- Together with the matching backend change removing the import rate limit,
+  large libraries now import completely; previously a sync stopped being
+  accepted after roughly 5,000 items and reported an under-counted total.
+- Playback is smoother: scrobble events are now sent from a background worker
+  instead of on Kodi's player callback thread, so a slow or unreachable
+  backend can no longer stall play, pause, resume, or the start of the next
+  episode. Events are still sent in order, and a queued stop event is
+  flushed before Kodi shuts down.
+- Removed a redundant offline-queue flush that ran when playback started; it
+  could replay hundreds of queued events before the video began.
+- Login is more reliable on shared connections: the approval poll now runs
+  every 5 seconds instead of every 3, no longer restarts its countdown when
+  the QR window is dismissed, and backs off when the server asks it to.
+  Being rate limited now says so instead of reporting a generic timeout.
+
 v1.5.0 (2026-07-10)
 - Live watched sync: manually marking a movie or episode watched in the
   Kodi library now syncs to PunchPlay within seconds (batched through the

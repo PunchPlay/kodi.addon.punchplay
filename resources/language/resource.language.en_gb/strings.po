@@ -541,3 +541,11 @@ msgstr ""
 msgctxt "#32134"
 msgid "Sync Kodi watched changes to PunchPlay"
 msgstr ""
+
+msgctxt "#32135"
+msgid "Partial sync — imported {0}. {1} item(s) could not be sent; run sync again."
+msgstr ""
+
+msgctxt "#32136"
+msgid "Too many login attempts from this network. Wait a few minutes, then try again."
+msgstr ""

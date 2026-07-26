@@ -4,10 +4,14 @@ PunchPlay is a background service addon that tracks movies and TV episodes you w
 
 It supports Kodi Nexus 20 and Omega 21.
 
-## What's New In 1.5.0
+## What's New In 1.5.1
 
-- Live watched sync: marking a movie or episode watched in the Kodi library now syncs to PunchPlay within seconds — no library import needed. Un-watching in Kodi never deletes PunchPlay history.
-- Library scans trigger a pull sync (when auto-sync is enabled) so newly added files immediately inherit PunchPlay watched states and resume points.
+- Large library imports now run to completion. Previously a full sync stopped being accepted after roughly 5,000 items and still reported success, silently dropping the rest.
+- A sync that hits errors now says how many items could not be sent, and stops after three consecutive failed batches instead of grinding on against an unreachable backend.
+- Scrobbles are sent from a background worker rather than on Kodi's player callback thread, so a slow or unreachable backend no longer stalls play, pause, resume, or the start of the next episode.
+- Login polling is friendlier to shared connections and now tells you when it has been rate limited instead of reporting a generic timeout.
+
+1.5.0 added live watched sync (marking a movie or episode watched in the Kodi library syncs to PunchPlay within seconds, and un-watching never deletes PunchPlay history) and pull sync on library scan, so newly added files inherit watched states and resume points.
 
 1.4.0 added two-way sync (PunchPlay watched history and resume points applied to the Kodi library), rewatch playcounts on library import, UTC-correct watch dates, non-blocking rating prompts, and several reliability fixes.
 

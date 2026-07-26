@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <addon id="script.punchplay"
        name="PunchPlay"
-       version="1.5.0"
+       version="1.5.1"
        provider-name="PunchPlay">
 
   <requires>
@@ -22,7 +22,7 @@
     <forum/>
     <website>https://punchplay.tv</website>
     <source>https://github.com/PunchPlay/kodi.addon.punchplay</source>
-    <news>1.5.0 - Live watched sync: marking items watched in Kodi now syncs to PunchPlay instantly, and library scans trigger a pull sync so new files inherit watched states and resume points.</news>
+    <news>1.5.1 - Large library imports now run to completion instead of stopping partway, and a sync that hits errors reports how many items were not sent. Scrobbles are sent from a background worker so a slow backend can no longer stall playback, and login polling is friendlier to shared connections.</news>
     <assets>
       <icon>icon.png</icon>
       <fanart>fanart.jpg</fanart>

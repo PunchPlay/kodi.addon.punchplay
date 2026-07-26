@@ -53,7 +53,11 @@ OFFLINE_QUEUE_MAX_ITEMS = 500
 # Flush touches at most one failing entry per minute, so this cap (~1 day of
 # continuous failures) drops poison payloads the backend will never accept.
 MAX_QUEUE_ATTEMPTS = 1440
-LIBRARY_SYNC_BATCH_SIZE = 50
+LIBRARY_SYNC_BATCH_SIZE = 100
+# Give up on a library sync after this many batches fail back-to-back — the
+# backend is down or rejecting us, and grinding through the rest just reports
+# a success that never happened.
+LIBRARY_SYNC_MAX_CONSECUTIVE_FAILURES = 3
 STOP_COMPLETE_GRACE_SECS = 3
 HEARTBEAT_INTERVAL_SECS = 15
 HEARTBEAT_MAX_CONSECUTIVE_ERRORS = 3
@@ -75,6 +79,19 @@ LIVE_SYNC_PULL_APPLIED_SUPPRESS_SECS = 600
 # once per SCAN_SYNC_MIN_INTERVAL_SECS.
 SCAN_SYNC_DELAY_SECS = 60
 SCAN_SYNC_MIN_INTERVAL_SECS = 30 * 60
+
+# Device-code polling.  The backend allows 200 token polls per 10 minutes per
+# IP and a device code lives 600s, so a 5s interval fits one full login attempt
+# (120 polls) inside the budget with room for a second device on the same IP.
+DEVICE_CODE_POLL_INTERVAL_SECS = 5
+DEVICE_CODE_THROTTLED_BACKOFF_SECS = 30
+DEVICE_CODE_MAX_BACKOFF_SECS = 60
+
+# Scrobble posts are dispatched to a worker thread so Kodi's player callbacks
+# never block on the network.
+POST_QUEUE_MAX_ITEMS = 100
+POST_QUEUE_PUT_TIMEOUT_SECS = 2
+POST_WORKER_JOIN_TIMEOUT_SECS = 10
 
 REQUEST_TIMEOUT_SECS = 15
 TEST_CONNECTION_TIMEOUT_SECS = 5

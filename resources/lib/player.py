@@ -15,6 +15,7 @@ A heartbeat thread fires every N seconds during active playback and POSTs
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import time
 import uuid
@@ -28,6 +29,9 @@ from constants import (
     HEARTBEAT_MAX_CONSECUTIVE_ERRORS,
     LIVE_SYNC_RECENT_PLAY_WINDOW_SECS,
     NOTIFICATION_TITLE,
+    POST_QUEUE_MAX_ITEMS,
+    POST_QUEUE_PUT_TIMEOUT_SECS,
+    POST_WORKER_JOIN_TIMEOUT_SECS,
     SCROBBLE_PAUSE_ENDPOINT,
     SCROBBLE_PROGRESS_ENDPOINT,
     SCROBBLE_RATE_ENDPOINT,
@@ -103,6 +107,13 @@ class PunchPlayPlayer(xbmc.Player):
         # Heartbeat thread management.
         self._hb_thread: threading.Thread | None = None
         self._hb_stop = threading.Event()
+
+        # Scrobble posts run on a single worker thread: Kodi's player
+        # callbacks must never block on the network, and one consumer keeps
+        # start → progress → pause → resume → stop in order.
+        self._post_queue: queue.Queue = queue.Queue(maxsize=POST_QUEUE_MAX_ITEMS)
+        self._post_thread: threading.Thread | None = None
+        self._post_thread_lock = threading.Lock()
 
         # Pending rating prompt — queued by the player callback thread and
         # drained by the service loop so modal dialogs never block Kodi's
@@ -268,6 +279,47 @@ class PunchPlayPlayer(xbmc.Player):
         return position, duration
 
     # ------------------------------------------------------------------
+    # Post worker thread
+    # ------------------------------------------------------------------
+
+    def _ensure_post_worker(self) -> None:
+        with self._post_thread_lock:
+            if self._post_thread is not None and self._post_thread.is_alive():
+                return
+            self._post_thread = threading.Thread(
+                target=self._post_worker, name="PunchPlayPost", daemon=True
+            )
+            self._post_thread.start()
+
+    def _post_worker(self) -> None:
+        while True:
+            job = self._post_queue.get()
+            try:
+                if job is None:  # shutdown sentinel
+                    return
+                job()
+            except Exception as exc:
+                xbmc.log(f"[PunchPlay] Post worker error: {exc}", xbmc.LOGWARNING)
+            finally:
+                self._post_queue.task_done()
+
+    def _dispatch(self, job) -> None:
+        """Hand *job* to the worker thread.  Never raises."""
+        self._ensure_post_worker()
+        try:
+            # A short bounded wait beats a 15s network timeout on the callback
+            # thread, and still lets a briefly backed-up queue drain.
+            self._post_queue.put(job, timeout=POST_QUEUE_PUT_TIMEOUT_SECS)
+        except queue.Full:
+            xbmc.log(
+                "[PunchPlay] Post queue full — dropping event to keep playback smooth",
+                xbmc.LOGWARNING,
+            )
+
+    def _dispatch_post(self, endpoint: str, payload: dict[str, Any]) -> None:
+        self._dispatch(lambda: self._api.post(endpoint, payload))
+
+    # ------------------------------------------------------------------
     # Heartbeat thread
     # ------------------------------------------------------------------
 
@@ -320,7 +372,7 @@ class PunchPlayPlayer(xbmc.Player):
                     f"({payload['position_seconds']}s / {payload['duration_seconds']}s)",
                     xbmc.LOGDEBUG,
                 )
-                self._api.post(SCROBBLE_PROGRESS_ENDPOINT, payload)
+                self._dispatch_post(SCROBBLE_PROGRESS_ENDPOINT, payload)
                 consecutive_errors = 0
 
             except Exception as exc:
@@ -426,9 +478,10 @@ class PunchPlayPlayer(xbmc.Player):
                 xbmc.LOGINFO,
             )
 
-            # Attempt to flush any offline queue before the new event.
-            self._api.flush_queue()
-            self._api.post(SCROBBLE_START_ENDPOINT, payload)
+            # The service loop flushes the offline queue every 60s; doing it
+            # here too would replay up to 500 queued posts on Kodi's player
+            # callback thread, stalling playback callbacks behind them.
+            self._dispatch_post(SCROBBLE_START_ENDPOINT, payload)
             self._start_heartbeat()
 
         except Exception as exc:
@@ -448,7 +501,7 @@ class PunchPlayPlayer(xbmc.Player):
                 position, duration = captured
             payload = self._build_payload(self._metadata, position, duration)
             xbmc.log(f"[PunchPlay] Paused at {position:.0f}s", xbmc.LOGDEBUG)
-            self._api.post(SCROBBLE_PAUSE_ENDPOINT, payload)
+            self._dispatch_post(SCROBBLE_PAUSE_ENDPOINT, payload)
         except Exception as exc:
             xbmc.log(f"[PunchPlay] onPlayBackPaused error: {exc}", xbmc.LOGDEBUG)
 
@@ -465,7 +518,7 @@ class PunchPlayPlayer(xbmc.Player):
                 position, duration = captured
             payload = self._build_payload(self._metadata, position, duration)
             xbmc.log(f"[PunchPlay] Resumed at {position:.0f}s", xbmc.LOGDEBUG)
-            self._api.post(SCROBBLE_RESUME_ENDPOINT, payload)
+            self._dispatch_post(SCROBBLE_RESUME_ENDPOINT, payload)
             self._start_heartbeat()
         except Exception as exc:
             xbmc.log(f"[PunchPlay] onPlayBackResumed error: {exc}", xbmc.LOGDEBUG)
@@ -479,6 +532,39 @@ class PunchPlayPlayer(xbmc.Player):
     # ------------------------------------------------------------------
     # Internal stop logic
     # ------------------------------------------------------------------
+
+    def _send_stop(
+        self,
+        *,
+        payload: dict[str, Any],
+        metadata: dict[str, Any],
+        settings: dict[str, Any],
+        session_id: str | None,
+        watched: bool,
+    ) -> None:
+        """
+        Post the stop event and queue any rating prompt.  Runs on the post
+        worker, so it may block on the network and on SQLite.  Shows no UI —
+        the service loop drains the queued prompt and displays it.
+        """
+        if session_id and self._cache is not None:
+            self._cache.delete_pending_scrobbles_for_session(session_id)
+
+        stop_resp = self._api.post(SCROBBLE_STOP_ENDPOINT, payload)
+
+        if not watched:
+            return
+        if not settings["rate_after_watching"]:
+            xbmc.log("[PunchPlay] Rating disabled in settings", xbmc.LOGINFO)
+            return
+
+        # The backend resolves canonical IDs we may not have had locally.
+        merged_metadata = dict(metadata)
+        if stop_resp and isinstance(stop_resp, dict):
+            for key in ("tmdb_id", "tvdb_id", "imdb_id", "punchplay_id"):
+                if stop_resp.get(key) is not None:
+                    merged_metadata[key] = stop_resp[key]
+        self._queue_rating_prompt(merged_metadata, settings, stop_resp=stop_resp)
 
     def _emit_stop(self, settings: dict[str, Any]) -> None:
         """Post a stop event for the current item (without clearing state)."""
@@ -509,9 +595,8 @@ class PunchPlayPlayer(xbmc.Player):
                 f"pos={payload['position_seconds']}s",
                 xbmc.LOGINFO,
             )
-            if self._playback_session_id and self._cache is not None:
-                self._cache.delete_pending_scrobbles_for_session(self._playback_session_id)
-            stop_resp = self._api.post(SCROBBLE_STOP_ENDPOINT, payload)
+            # Notify here, on the callback thread — Kodi wants UI calls off
+            # background threads, and this is cheap.
             if watched:
                 _s = localize
                 title = self._metadata.get("title", "")
@@ -527,18 +612,19 @@ class PunchPlayPlayer(xbmc.Player):
                     msg = _s(32013).format(title)
                 self._notify(msg, settings)
 
-                # Queue the rating prompt for the service loop — never show
-                # modal dialogs from the player callback thread, or Kodi's
-                # subsequent playback callbacks stall behind them.
-                if not settings["rate_after_watching"]:
-                    xbmc.log("[PunchPlay] Rating disabled in settings", xbmc.LOGINFO)
-                else:
-                    merged_metadata = dict(self._metadata)
-                    if stop_resp and isinstance(stop_resp, dict):
-                        for key in ("tmdb_id", "tvdb_id", "imdb_id", "punchplay_id"):
-                            if stop_resp.get(key) is not None:
-                                merged_metadata[key] = stop_resp[key]
-                    self._queue_rating_prompt(merged_metadata, settings, stop_resp=stop_resp)
+            # Snapshot everything the worker needs — _handle_stop clears this
+            # instance state as soon as we return.
+            metadata = dict(self._metadata)
+            session_id = self._playback_session_id
+            self._dispatch(
+                lambda: self._send_stop(
+                    payload=payload,
+                    metadata=metadata,
+                    settings=settings,
+                    session_id=session_id,
+                    watched=watched,
+                )
+            )
         except Exception as exc:
             xbmc.log(f"[PunchPlay] Stop emit error: {exc}", xbmc.LOGDEBUG)
 
@@ -727,3 +813,27 @@ class PunchPlayPlayer(xbmc.Player):
         self._stop_emitted = False
         with self._rating_lock:
             self._pending_rating = None
+        self._stop_post_worker()
+
+    def _stop_post_worker(self) -> None:
+        """Let queued posts finish before shutdown — the last one is usually
+        the stop event for whatever was playing."""
+        with self._post_thread_lock:
+            thread = self._post_thread
+            self._post_thread = None
+        if thread is None or not thread.is_alive():
+            return
+        try:
+            self._post_queue.put_nowait(None)
+        except queue.Full:
+            xbmc.log(
+                "[PunchPlay] Post queue full at shutdown — worker left to exit",
+                xbmc.LOGDEBUG,
+            )
+            return
+        thread.join(timeout=POST_WORKER_JOIN_TIMEOUT_SECS)
+        if thread.is_alive():
+            xbmc.log(
+                "[PunchPlay] Post worker still busy at shutdown — abandoning it",
+                xbmc.LOGWARNING,
+            )

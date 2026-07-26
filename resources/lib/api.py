@@ -35,6 +35,9 @@ from constants import (
     AUTH_ME_ENDPOINT,
     AUTH_REFRESH_ENDPOINT,
     DEFAULT_BACKEND_URL,
+    DEVICE_CODE_MAX_BACKOFF_SECS,
+    DEVICE_CODE_POLL_INTERVAL_SECS,
+    DEVICE_CODE_THROTTLED_BACKOFF_SECS,
     HEARTBEAT_INTERVAL_SECS,
     IDENTIFIER_NO_MATCH_CACHE_TTL_SECS,
     IDENTIFIER_SUCCESS_CACHE_TTL_SECS,
@@ -56,6 +59,19 @@ from constants import (
 
 class BackendConfigurationError(ValueError):
     """Raised when the configured backend URL is unsafe or malformed."""
+
+
+def _retry_after_seconds(exc: urllib.error.HTTPError, default: int) -> int:
+    """Read a Retry-After header, clamped to a sane polling range."""
+    try:
+        raw = (exc.headers or {}).get("Retry-After")
+    except AttributeError:
+        raw = None
+    try:
+        value = int(raw) if raw else 0
+    except (TypeError, ValueError):
+        value = 0
+    return max(default, min(value or default, DEVICE_CODE_MAX_BACKOFF_SECS))
 
 
 def _sanitise_url_for_display(url: str) -> str:
@@ -704,10 +720,16 @@ class APIClient:
         user_code: str,
         device_code: str,
         expires_in: int,
+        deadline: float,
+        status: dict[str, Any],
     ) -> bool | None:
         """
         Present the QR LoginDialog while polling for approval in the
         background.
+
+        *deadline* is the absolute monotonic time the device code expires —
+        shared with the fallback poll loop so the two never poll a dead code.
+        *status* is written back into: {"throttled": bool}.
 
         Returns:
           True  — login succeeded (dialog auto-closed on approval)
@@ -741,12 +763,12 @@ class APIClient:
 
             def poll_loop() -> None:
                 monitor = xbmc.Monitor()
-                deadline = time.monotonic() + expires_in
                 while (
                     not stop_event.is_set()
                     and time.monotonic() < deadline
                     and not monitor.abortRequested()
                 ):
+                    wait_secs = DEVICE_CODE_POLL_INTERVAL_SECS
                     try:
                         resp = self._request(
                             "POST",
@@ -773,14 +795,30 @@ class APIClient:
                             login_dialog.approve()
                             return
                     except urllib.error.HTTPError as exc:
-                        xbmc.log(f"[PunchPlay] QR poll: HTTP {exc.code}", xbmc.LOGDEBUG)
+                        if exc.code == 429:
+                            # Polling faster than the backend allows only digs
+                            # the hole deeper — back off and remember why.
+                            status["throttled"] = True
+                            wait_secs = _retry_after_seconds(
+                                exc, DEVICE_CODE_THROTTLED_BACKOFF_SECS
+                            )
+                            xbmc.log(
+                                f"[PunchPlay] QR poll rate limited — waiting {wait_secs}s",
+                                xbmc.LOGWARNING,
+                            )
+                        else:
+                            xbmc.log(
+                                f"[PunchPlay] QR poll: HTTP {exc.code}", xbmc.LOGDEBUG
+                            )
                     except Exception as exc:
                         xbmc.log(f"[PunchPlay] QR poll error: {exc}", xbmc.LOGWARNING)
                     # Sleep in short slices so we can react to stop_event.
-                    for _ in range(6):
+                    slept = 0.0
+                    while slept < wait_secs:
                         if stop_event.is_set():
                             return
                         time.sleep(0.5)
+                        slept += 0.5
 
             thread = threading.Thread(
                 target=poll_loop, name="PunchPlayQRPoll", daemon=True
@@ -856,6 +894,13 @@ class APIClient:
         #   True  → login completed, we're done
         #   None  → user dismissed manually, fall through to poll loop
         #   False → dialog failed to show, fall back to text dialog
+        # One absolute deadline for the whole attempt.  The QR dialog and the
+        # fallback poll loop run back to back, so giving each its own fresh
+        # `expires_in` window would poll an already-dead code for a second
+        # full period — and burn the per-IP token budget doing it.
+        deadline = time.monotonic() + expires_in
+        status: dict[str, Any] = {"throttled": False}
+
         qr_result: bool | None = False
         if verification_uri_qr:
             qr_path = self._write_qr_image(verification_uri_qr)
@@ -866,6 +911,8 @@ class APIClient:
                     user_code=user_code,
                     device_code=device_code,
                     expires_in=expires_in,
+                    deadline=deadline,
+                    status=status,
                 )
 
         if qr_result is True:
@@ -885,7 +932,6 @@ class APIClient:
         # Step 3 — poll for the token with a cancellable progress dialog.
         # (Only reached if QR dialog was dismissed manually or not shown.)
         monitor = xbmc.Monitor()
-        deadline = time.monotonic() + expires_in
         progress = xbmcgui.DialogProgress()
         progress.create(_s(32006), _s(32007))
 
@@ -898,6 +944,7 @@ class APIClient:
                 remaining = max(0, int(deadline - time.monotonic()))
                 pct = int(100 * (1 - remaining / expires_in))
                 progress.update(pct, _s(32008).format(remaining))
+                wait_secs = DEVICE_CODE_POLL_INTERVAL_SECS
 
                 try:
                     token_resp = self._request(
@@ -925,6 +972,21 @@ class APIClient:
                 except ConnectionError as exc:
                     xbmc.log(f"[PunchPlay] Poll network error: {exc}", xbmc.LOGDEBUG)
                 except urllib.error.HTTPError as exc:
+                    if exc.code == 429:
+                        # Distinct from authorization_pending: the request was
+                        # never evaluated.  Back off instead of spending the
+                        # remaining budget at the same rate.
+                        status["throttled"] = True
+                        wait_secs = _retry_after_seconds(
+                            exc, DEVICE_CODE_THROTTLED_BACKOFF_SECS
+                        )
+                        xbmc.log(
+                            f"[PunchPlay] Login poll rate limited — waiting {wait_secs}s",
+                            xbmc.LOGWARNING,
+                        )
+                        monitor.waitForAbort(wait_secs)
+                        continue
+
                     # The /token endpoint returns 400 for all non-success
                     # states.  Read the body to distinguish between
                     # "authorization_pending" (keep polling) and terminal
@@ -957,14 +1019,16 @@ class APIClient:
                         xbmc.LOGWARNING,
                     )
 
-                monitor.waitForAbort(5)
+                monitor.waitForAbort(wait_secs)
         finally:
             try:
                 progress.close()
             except Exception:
                 pass
 
-        dialog.ok(_s(32000), _s(32010))
+        # A run that spent its window being throttled is not the same failure
+        # as nobody approving the code — say which one happened.
+        dialog.ok(_s(32000), _s(32136) if status["throttled"] else _s(32010))
         return False
 
     # ------------------------------------------------------------------
