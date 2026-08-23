@@ -13,6 +13,7 @@ Kodi library are counted as unmatched and skipped.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -206,6 +207,46 @@ def _set_resume(kodi_item: dict[str, Any], remote: dict[str, Any]) -> None:
         )
 
 
+def _record_failed_item(
+    failed_out: set[str] | None,
+    operation: str,
+    remote: dict[str, Any],
+) -> None:
+    """Add a stable, non-sensitive identity for a failed library write.
+
+    The service persists consecutive retry counts per identity, so a new
+    failure cannot inherit an unrelated item's exhausted retry allowance.
+    """
+    if failed_out is None:
+        return
+    identity_fields = (
+        "media_type",
+        "punchplay_id",
+        "tmdb_id",
+        "imdb_id",
+        "show_tmdb_id",
+        "show_imdb_id",
+        "season",
+        "episode",
+        "title",
+        "year",
+    )
+    identity = {
+        key: remote.get(key)
+        for key in identity_fields
+        if remote.get(key) is not None
+    }
+    if not identity:
+        identity = {"unidentified": True}
+    raw = json.dumps(
+        {"operation": operation, "identity": identity},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    failed_out.add(hashlib.sha256(raw).hexdigest())
+
+
 def run_pull_sync(
     api,
     *,
@@ -214,16 +255,20 @@ def run_pull_sync(
     since_ms: int | None = None,
     progress_callback=None,
     applied_out: set | None = None,
+    failed_out: set[str] | None = None,
 ) -> dict[str, int]:
     """
     Fetch PunchPlay state and apply it to the Kodi library.
 
     Returns a summary dict:
       movies_marked / episodes_marked / resume_set / unmatched /
-      already_synced / cancelled
+      already_synced / cancelled / apply_failed
     When `applied_out` is given, ("movie"|"episode", library_id) tuples are
     added for every watched state we set — live watched sync uses these to
     suppress the resulting OnUpdate echoes.
+    When `failed_out` is given, stable hashed identities are added for every
+    library write that failed so checkpoint retry counts can be scoped per
+    item without persisting media metadata.
     Raises on fetch failure (callers surface the error).
     """
     path = SCROBBLE_SYNC_ENDPOINT
@@ -242,6 +287,7 @@ def run_pull_sync(
         "unmatched": 0,
         "already_synced": 0,
         "cancelled": 0,
+        "apply_failed": 0,
     }
     if not movies and not episodes and not in_progress:
         return summary
@@ -275,6 +321,8 @@ def run_pull_sync(
                 if applied_out is not None:
                     applied_out.add(("movie", int(movie["movieid"])))
             except (RuntimeError, KeyError, TypeError, ValueError) as exc:
+                summary["apply_failed"] += 1
+                _record_failed_item(failed_out, "movie_watched", remote_movie)
                 xbmc.log(f"[PunchPlay] Pull sync movie error: {exc}", xbmc.LOGWARNING)
 
         for remote_episode in episodes:
@@ -293,6 +341,8 @@ def run_pull_sync(
                 if applied_out is not None:
                     applied_out.add(("episode", int(episode["episodeid"])))
             except (RuntimeError, KeyError, TypeError, ValueError) as exc:
+                summary["apply_failed"] += 1
+                _record_failed_item(failed_out, "episode_watched", remote_episode)
                 xbmc.log(f"[PunchPlay] Pull sync episode error: {exc}", xbmc.LOGWARNING)
 
     if apply_resume:
@@ -312,12 +362,12 @@ def run_pull_sync(
             try:
                 _set_resume(kodi_item, remote_item)
                 summary["resume_set"] += 1
-                if applied_out is not None:
-                    if "movieid" in kodi_item:
-                        applied_out.add(("movie", int(kodi_item["movieid"])))
-                    else:
-                        applied_out.add(("episode", int(kodi_item["episodeid"])))
+                # Resume writes never touch playcount, so they must not enter
+                # the echo-suppression set — doing so would silently drop a
+                # genuine manual watched-toggle made shortly afterward.
             except (RuntimeError, KeyError, TypeError, ValueError) as exc:
+                summary["apply_failed"] += 1
+                _record_failed_item(failed_out, "resume", remote_item)
                 xbmc.log(f"[PunchPlay] Pull sync resume error: {exc}", xbmc.LOGWARNING)
 
     return summary

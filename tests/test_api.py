@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import importlib
+import io
+import json
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import types
+import urllib.error
 import unittest
 
 LIB_DIR = os.path.abspath(
@@ -269,6 +273,120 @@ class IdentifyMediaTests(unittest.TestCase):
         )
         self.assertIsNone(result)
         self.assertEqual(calls, [])
+
+
+class TokenRefreshTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.mkdtemp(prefix="punchplay-refresh-tests-")
+        self.fake_addon = _FakeAddon()
+        self.original_get_addon = api_module.get_addon
+        self.original_get_profile_dir = api_module.get_profile_dir
+        self.original_get_addon_version = api_module.get_addon_version
+        api_module.get_addon = lambda: self.fake_addon
+        api_module.get_profile_dir = lambda: self.temp_dir
+        api_module.get_addon_version = lambda: "1.5.2"
+        self.client = api_module.APIClient()
+        self.client._tokens = {
+            "access_token": "expired-access",
+            "refresh_token": "refresh-1",
+        }
+
+    def tearDown(self) -> None:
+        api_module.get_addon = self.original_get_addon
+        api_module.get_profile_dir = self.original_get_profile_dir
+        api_module.get_addon_version = self.original_get_addon_version
+        shutil.rmtree(self.temp_dir)
+
+    def test_in_flight_401_reuses_token_rotated_by_another_thread(self) -> None:
+        """A delayed 401 must not rotate the refresh chain a second time."""
+
+        class _Response:
+            def __init__(self, payload: dict[str, str]) -> None:
+                self._raw = json.dumps(payload).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self._raw
+
+        first_request_started = threading.Event()
+        first_refresh_completed = threading.Event()
+        state_lock = threading.Lock()
+        expired_request_count = 0
+        refresh_tokens: list[str] = []
+
+        def _unauthorized(url: str) -> urllib.error.HTTPError:
+            return urllib.error.HTTPError(
+                url,
+                401,
+                "Unauthorized",
+                {},
+                io.BytesIO(b'{"message":"Unauthorized"}'),
+            )
+
+        def _urlopen(request, timeout=0):
+            nonlocal expired_request_count
+            _ = timeout
+            if request.full_url.endswith("/api/auth/refresh"):
+                payload = json.loads(request.data.decode("utf-8"))
+                with state_lock:
+                    refresh_tokens.append(payload["refresh_token"])
+                first_refresh_completed.set()
+                return _Response(
+                    {"access_token": "access-2", "refresh_token": "refresh-2"}
+                )
+
+            authorization = request.headers.get("Authorization")
+            if authorization == "Bearer expired-access":
+                with state_lock:
+                    expired_request_count += 1
+                    request_number = expired_request_count
+                if request_number == 1:
+                    first_request_started.set()
+                    if not first_refresh_completed.wait(2):
+                        raise RuntimeError("test refresh did not complete")
+                raise _unauthorized(request.full_url)
+
+            if authorization == "Bearer access-2":
+                return _Response({"ok": "true"})
+
+            raise AssertionError(f"unexpected authorization: {authorization!r}")
+
+        original_urlopen = api_module.urllib.request.urlopen
+        self.addCleanup(
+            setattr,
+            api_module.urllib.request,
+            "urlopen",
+            original_urlopen,
+        )
+        api_module.urllib.request.urlopen = _urlopen
+        results: list[dict[str, str]] = []
+        errors: list[BaseException] = []
+
+        def _request() -> None:
+            try:
+                results.append(self.client.get("/api/test"))
+            except BaseException as exc:  # keep worker failures visible below
+                errors.append(exc)
+
+        delayed = threading.Thread(target=_request)
+        delayed.start()
+        self.assertTrue(first_request_started.wait(2))
+
+        refreshing = threading.Thread(target=_request)
+        refreshing.start()
+        delayed.join(timeout=3)
+        refreshing.join(timeout=3)
+
+        self.assertFalse(delayed.is_alive())
+        self.assertFalse(refreshing.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(refresh_tokens, ["refresh-1"])
 
 
 if __name__ == "__main__":

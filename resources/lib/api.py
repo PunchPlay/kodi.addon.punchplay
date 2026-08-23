@@ -161,7 +161,7 @@ class APIClient:
 
         # Guards _do_refresh: the heartbeat thread and the service thread can
         # both hit a 401 at the same time, and concurrent refreshes with a
-        # rotating refresh token would log the device out.
+        # rotating refresh token would invalidate the first retry.
         self._refresh_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -261,14 +261,14 @@ class APIClient:
         with os.fdopen(fd, "w") as f:
             json.dump(tokens, f, indent=2)
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, access_token: str | None) -> dict[str, str]:
         headers = {
             "Content-Type": "application/json",
             "User-Agent": f"{ADDON_ID}/{self._client_version} Kodi",
             "Accept": "application/json",
         }
-        if self._tokens.get("access_token"):
-            headers["Authorization"] = f"Bearer {self._tokens['access_token']}"
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
         return headers
 
     def _identify_cache_key(
@@ -459,8 +459,16 @@ class APIClient:
         """
         url = f"{self._base_url()}{path}"
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        # Keep the credential that is actually sent with this request.  A
+        # different thread may rotate the token while this request is in
+        # flight; in that case its 401 must reuse the newer token rather than
+        # rotating the refresh chain a second time.
+        access_token_at_request = self._tokens.get("access_token")
         req = urllib.request.Request(
-            url, data=body, headers=self._headers(), method=method
+            url,
+            data=body,
+            headers=self._headers(access_token_at_request),
+            method=method,
         )
 
         try:
@@ -470,7 +478,7 @@ class APIClient:
         except urllib.error.HTTPError as exc:
             if exc.code == 401 and retry_on_401:
                 xbmc.log("[PunchPlay] 401 — attempting token refresh", xbmc.LOGDEBUG)
-                if self._do_refresh():
+                if self._do_refresh(access_token_at_request):
                     return self._request(
                         method, path, payload, retry_on_401=False, timeout=timeout
                     )
@@ -482,15 +490,20 @@ class APIClient:
     # Token refresh
     # ------------------------------------------------------------------
 
-    def _do_refresh(self) -> bool:
-        token_at_entry = self._tokens.get("refresh_token")
-        if not token_at_entry:
-            return False
+    def _do_refresh(self, stale_access_token: str | None) -> bool:
         with self._refresh_lock:
+            # The request that produced the 401 may have been sent before
+            # another thread refreshed successfully.  Reuse that refresh
+            # result; refreshing again rotates the backend's access token and
+            # invalidates the other thread's retry.
+            current_access_token = self._tokens.get("access_token")
+            if current_access_token != stale_access_token:
+                return bool(current_access_token)
+
             refresh_token = self._tokens.get("refresh_token")
-            if refresh_token != token_at_entry:
-                # Another thread refreshed while we waited on the lock.
-                return bool(self._tokens.get("access_token"))
+            if not refresh_token:
+                return False
+
             return self._do_refresh_locked(refresh_token)
 
     def _do_refresh_locked(self, refresh_token: str) -> bool:

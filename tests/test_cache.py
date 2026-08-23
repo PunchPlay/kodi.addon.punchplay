@@ -87,11 +87,17 @@ class CacheTests(unittest.TestCase):
         self.assertIn("attempt_count", columns)
         self.assertIn("last_attempt_at", columns)
         self.assertIn("last_error", columns)
+        self.assertIn("event_created_at", columns)
         with cache._connect() as conn:  # pylint: disable=protected-access
             identifier_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(identifier_cache)")
             }
         self.assertIn("expires_at", identifier_columns)
+        with cache._connect() as conn:  # pylint: disable=protected-access
+            runtime_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(runtime_status)")
+            }
+        self.assertIn("pull_sync_failure_counts", runtime_columns)
 
     def test_queue_prefers_dropping_progress_before_stop(self) -> None:
         cache_module.OFFLINE_QUEUE_MAX_ITEMS = 2
@@ -176,6 +182,72 @@ class CacheTests(unittest.TestCase):
             status["last_pull_sync_summary"], "3 watched, 1 resume, 0 unmatched"
         )
         self.assertIsNotNone(status["last_pull_sync_at"])
+
+    def test_pending_scrobbles_replay_by_event_time_not_insertion_order(self) -> None:
+        # A later event can be persisted before an earlier one that was still
+        # in flight (e.g. shutdown draining a queue ahead of a slow request
+        # that self-persists once it finally times out). Replay must follow
+        # what actually happened, not which write happened to land first.
+        cache = cache_module.Cache()
+        cache.enqueue_scrobble(
+            constants.SCROBBLE_STOP_ENDPOINT,
+            {"event_id": "stop", "event_created_at": 2000},
+        )
+        cache.enqueue_scrobble(
+            constants.SCROBBLE_PROGRESS_ENDPOINT,
+            {"event_id": "progress", "event_created_at": 1000},
+        )
+
+        event_ids = [
+            item["payload"].get("event_id") for item in cache.get_pending_scrobbles()
+        ]
+
+        self.assertEqual(event_ids, ["progress", "stop"])
+
+    def test_enqueue_scrobbles_batches_in_one_call(self) -> None:
+        cache = cache_module.Cache()
+        cache.enqueue_scrobbles(
+            [
+                (constants.SCROBBLE_PROGRESS_ENDPOINT, {"event_id": "progress", "event_created_at": 1000}),
+                (constants.SCROBBLE_STOP_ENDPOINT, {"event_id": "stop", "event_created_at": 2000}),
+            ]
+        )
+
+        event_ids = [
+            item["payload"].get("event_id") for item in cache.get_pending_scrobbles()
+        ]
+
+        self.assertEqual(event_ids, ["progress", "stop"])
+
+    def test_enqueue_scrobbles_noop_for_empty_list(self) -> None:
+        cache = cache_module.Cache()
+        cache.enqueue_scrobbles([])
+
+        self.assertEqual(cache.get_pending_scrobbles(), [])
+
+    def test_record_pull_sync_held_increments_and_resets_on_success(self) -> None:
+        cache = cache_module.Cache()
+
+        self.assertEqual(cache.record_pull_sync_held({"movie-a"}), 1)
+        self.assertEqual(cache.record_pull_sync_held({"movie-a"}), 2)
+
+        cache.record_pull_sync("2 watched, 0 resume, 0 unmatched, 0 failed")
+
+        self.assertEqual(cache.record_pull_sync_held({"movie-a"}), 1)
+
+    def test_pull_sync_held_counts_are_scoped_per_failed_item(self) -> None:
+        cache = cache_module.Cache()
+
+        self.assertEqual(cache.record_pull_sync_held({"movie-a"}), 1)
+        self.assertEqual(cache.record_pull_sync_held({"movie-a"}), 2)
+        # A newly failing item starts at one even though movie-a has already
+        # consumed two retries, so advancing now cannot silently skip it.
+        self.assertEqual(
+            cache.record_pull_sync_held({"movie-a", "movie-b"}),
+            1,
+        )
+        # Once movie-b succeeds, movie-a retains its consecutive history.
+        self.assertEqual(cache.record_pull_sync_held({"movie-a"}), 4)
 
     def test_queue_endpoint_summary_counts_entries(self) -> None:
         cache = cache_module.Cache()

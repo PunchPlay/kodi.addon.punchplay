@@ -26,7 +26,7 @@ import xbmc
 from constants import (
     LIVE_SYNC_DEBOUNCE_SECS,
     LIVE_SYNC_MAX_BATCH,
-    LIVE_SYNC_PULL_APPLIED_SUPPRESS_SECS,
+    LIVE_SYNC_ECHO_SUPPRESS_SECS,
     kodi_datetime_to_utc_iso,
 )
 from pull_sync import _rpc
@@ -145,7 +145,7 @@ class LiveWatchedSync:
             ]
 
             # Prune stale pull-applied suppressions while we hold the lock.
-            cutoff = current - LIVE_SYNC_PULL_APPLIED_SUPPRESS_SECS
+            cutoff = current - LIVE_SYNC_ECHO_SUPPRESS_SECS
             self._pull_applied = {
                 key: applied_at
                 for key, applied_at in self._pull_applied.items()

@@ -291,6 +291,65 @@ class RunPullSyncTests(unittest.TestCase):
         self.assertEqual(resume_call["resume"]["position"], 1200)
         self.assertEqual(resume_call["resume"]["total"], 3600)
 
+    def test_resume_only_sync_does_not_populate_applied_out(self) -> None:
+        # A resume-only write must never enter the echo-suppression set: it
+        # never touches playcount, so treating it as a watched-toggle echo
+        # would silently drop a genuine manual "mark as watched" made shortly
+        # after PunchPlay syncs a resume point down to Kodi.
+        class _FakeAPI:
+            def get(self, path, timeout=0):
+                _ = path, timeout
+                return {
+                    "movies": [],
+                    "episodes": [],
+                    "in_progress": [
+                        {
+                            "media_type": "movie",
+                            "tmdb_id": 550,
+                            "position_seconds": 1200,
+                            "duration_seconds": 3600,
+                            "updated_at": "2026-07-03T00:00:00Z",
+                        },
+                    ],
+                }
+
+        applied: set = set()
+        summary = pull_sync.run_pull_sync(
+            _FakeAPI(), apply_watched=False, apply_resume=True, applied_out=applied
+        )
+
+        self.assertEqual(summary["resume_set"], 1)
+        self.assertEqual(applied, set())
+
+    def test_apply_failure_is_counted(self) -> None:
+        def _raise_on_set_watched(method: str, params: dict) -> dict:
+            if method == "VideoLibrary.SetMovieDetails":
+                raise RuntimeError("Kodi RPC unavailable")
+            self.rpc_calls.append((method, params))
+            return {}
+
+        pull_sync._rpc = _raise_on_set_watched
+
+        class _FakeAPI:
+            def get(self, path, timeout=0):
+                _ = path, timeout
+                return {
+                    "movies": [
+                        {"tmdb_id": 550, "watched_at": "2026-07-01T00:00:00Z", "playcount": 2},
+                    ],
+                    "episodes": [],
+                    "in_progress": [],
+                }
+
+        failed: set[str] = set()
+        summary = pull_sync.run_pull_sync(
+            _FakeAPI(), apply_watched=True, apply_resume=False, failed_out=failed
+        )
+
+        self.assertEqual(summary["movies_marked"], 0)
+        self.assertEqual(summary["apply_failed"], 1)
+        self.assertEqual(len(failed), 1)
+
     def test_empty_remote_state_is_a_noop(self) -> None:
         class _FakeAPI:
             def get(self, path, timeout=0):

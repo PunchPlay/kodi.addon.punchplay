@@ -549,3 +549,7 @@ msgstr ""
 msgctxt "#32136"
 msgid "Too many login attempts from this network. Wait a few minutes, then try again."
 msgstr ""
+
+msgctxt "#32137"
+msgid "PunchPlay sync: {0} applied, {1} failed — will retry"
+msgstr ""

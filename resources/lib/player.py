@@ -19,7 +19,7 @@ import queue
 import threading
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable, NamedTuple
 
 import xbmc
 import xbmcgui
@@ -27,7 +27,7 @@ import xbmcgui
 from constants import (
     HEARTBEAT_INTERVAL_SECS,
     HEARTBEAT_MAX_CONSECUTIVE_ERRORS,
-    LIVE_SYNC_RECENT_PLAY_WINDOW_SECS,
+    LIVE_SYNC_ECHO_SUPPRESS_SECS,
     NOTIFICATION_TITLE,
     POST_QUEUE_MAX_ITEMS,
     POST_QUEUE_PUT_TIMEOUT_SECS,
@@ -86,6 +86,16 @@ def has_reliable_rating_identity(metadata: dict[str, Any]) -> bool:
     return any(metadata.get(key) for key in ("punchplay_id", "tmdb_id", "tvdb_id", "imdb_id"))
 
 
+class _PostJob(NamedTuple):
+    """A queued scrobble post. `endpoint`/`payload` describe the network
+    write so a job that never got to run can still be persisted to the
+    offline queue at shutdown; `run` is what the worker actually executes."""
+
+    endpoint: str
+    payload: dict[str, Any]
+    run: Callable[[], None]
+
+
 class PunchPlayPlayer(xbmc.Player):
     def __init__(self, api, cache) -> None:
         super().__init__()
@@ -114,6 +124,12 @@ class PunchPlayPlayer(xbmc.Player):
         self._post_queue: queue.Queue = queue.Queue(maxsize=POST_QUEUE_MAX_ITEMS)
         self._post_thread: threading.Thread | None = None
         self._post_thread_lock = threading.Lock()
+        self._post_state_lock = threading.Lock()
+        self._active_post_job: _PostJob | None = None
+        # Set only after shutdown's grace period expires. It prevents the
+        # worker from taking another queued job while cleanup snapshots the
+        # active job and drains the backlog to SQLite.
+        self._post_abandon = threading.Event()
 
         # Pending rating prompt — queued by the player callback thread and
         # drained by the service loop so modal dialogs never block Kodi's
@@ -249,7 +265,7 @@ class PunchPlayPlayer(xbmc.Player):
 
     def _stamp_library_item(self, media_type: str, dbid: int) -> None:
         now = time.monotonic()
-        cutoff = now - LIVE_SYNC_RECENT_PLAY_WINDOW_SECS
+        cutoff = now - LIVE_SYNC_ECHO_SUPPRESS_SECS
         with self._library_items_lock:
             self._recent_library_items = [
                 item
@@ -260,7 +276,7 @@ class PunchPlayPlayer(xbmc.Player):
 
     def recent_library_items(self) -> list[tuple[str, int, float]]:
         """Recently played library items — consumed by live watched sync."""
-        cutoff = time.monotonic() - LIVE_SYNC_RECENT_PLAY_WINDOW_SECS
+        cutoff = time.monotonic() - LIVE_SYNC_ECHO_SUPPRESS_SECS
         with self._library_items_lock:
             self._recent_library_items = [
                 item for item in self._recent_library_items if item[2] >= cutoff
@@ -293,17 +309,36 @@ class PunchPlayPlayer(xbmc.Player):
 
     def _post_worker(self) -> None:
         while True:
-            job = self._post_queue.get()
-            try:
-                if job is None:  # shutdown sentinel
+            # Hold the state lock across dequeue + active assignment. Cleanup
+            # can therefore never observe a job in the tiny gap where it has
+            # left the queue but is not yet recorded as in flight. The short
+            # timeout bounds how long cleanup can wait when the queue is idle.
+            with self._post_state_lock:
+                if self._post_abandon.is_set():
                     return
-                job()
+                try:
+                    job = self._post_queue.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+                if job is not None:
+                    self._active_post_job = job
+            if job is None:  # shutdown sentinel
+                self._post_queue.task_done()
+                return
+            try:
+                job.run()
             except Exception as exc:
                 xbmc.log(f"[PunchPlay] Post worker error: {exc}", xbmc.LOGWARNING)
             finally:
+                with self._post_state_lock:
+                    if self._active_post_job is job:
+                        self._active_post_job = None
+                    should_abandon = self._post_abandon.is_set()
                 self._post_queue.task_done()
+            if should_abandon:
+                return
 
-    def _dispatch(self, job) -> None:
+    def _dispatch(self, job: _PostJob) -> None:
         """Hand *job* to the worker thread.  Never raises."""
         self._ensure_post_worker()
         try:
@@ -317,7 +352,7 @@ class PunchPlayPlayer(xbmc.Player):
             )
 
     def _dispatch_post(self, endpoint: str, payload: dict[str, Any]) -> None:
-        self._dispatch(lambda: self._api.post(endpoint, payload))
+        self._dispatch(_PostJob(endpoint, payload, lambda: self._api.post(endpoint, payload)))
 
     # ------------------------------------------------------------------
     # Heartbeat thread
@@ -617,12 +652,16 @@ class PunchPlayPlayer(xbmc.Player):
             metadata = dict(self._metadata)
             session_id = self._playback_session_id
             self._dispatch(
-                lambda: self._send_stop(
-                    payload=payload,
-                    metadata=metadata,
-                    settings=settings,
-                    session_id=session_id,
-                    watched=watched,
+                _PostJob(
+                    SCROBBLE_STOP_ENDPOINT,
+                    payload,
+                    lambda: self._send_stop(
+                        payload=payload,
+                        metadata=metadata,
+                        settings=settings,
+                        session_id=session_id,
+                        watched=watched,
+                    ),
                 )
             )
         except Exception as exc:
@@ -784,17 +823,23 @@ class PunchPlayPlayer(xbmc.Player):
             xbmc.log(f"[PunchPlay] Rating dialog error: {exc}", xbmc.LOGDEBUG)
 
     def _handle_stop(self) -> None:
+        # Kodi bumps the item's playcount around now — refresh the echo
+        # suppression window that started when playback began. This must run
+        # even when nothing was tracked (identify failed, or the play was
+        # filtered by min_length_minutes): those plays only ever got the
+        # start-time stamp, and without a stop-time refresh the suppression
+        # window could lapse before Kodi's own echo arrives, letting a
+        # filtered-out play leak into live sync as if it were a manual toggle.
+        if self._current_library_item is not None:
+            self._stamp_library_item(*self._current_library_item)
+            self._current_library_item = None
+
         if self._metadata is None or self._stop_emitted:
             return
         try:
             self._stop_emitted = True
             self._is_playing = False
             self._stop_heartbeat()
-            # Kodi bumps the item's playcount around now — refresh the echo
-            # suppression window that started when playback began.
-            if self._current_library_item is not None:
-                self._stamp_library_item(*self._current_library_item)
-                self._current_library_item = None
             self._emit_stop(self._settings())
         finally:
             self._metadata = None
@@ -823,17 +868,66 @@ class PunchPlayPlayer(xbmc.Player):
             self._post_thread = None
         if thread is None or not thread.is_alive():
             return
+        sentinel_enqueued = False
         try:
             self._post_queue.put_nowait(None)
+            sentinel_enqueued = True
         except queue.Full:
             xbmc.log(
-                "[PunchPlay] Post queue full at shutdown — worker left to exit",
+                "[PunchPlay] Post queue full at shutdown — will persist backlog",
                 xbmc.LOGDEBUG,
             )
-            return
         thread.join(timeout=POST_WORKER_JOIN_TIMEOUT_SECS)
         if thread.is_alive():
             xbmc.log(
                 "[PunchPlay] Post worker still busy at shutdown — abandoning it",
                 xbmc.LOGWARNING,
+            )
+            # Stop the worker from taking another job while the queue and its
+            # current in-flight job are snapshotted for offline replay.
+            with self._post_state_lock:
+                self._post_abandon.set()
+                active_job = self._active_post_job
+            if not sentinel_enqueued:
+                try:
+                    # Wake a worker that drained a previously-full queue and
+                    # is now blocked in get(). If the drain wins this race and
+                    # consumes the sentinel first, the leftover daemon thread
+                    # is harmless; all real jobs are still persisted below.
+                    self._post_queue.put_nowait(None)
+                except queue.Full:
+                    pass
+            self._persist_unsent_queue(active_job=active_job)
+
+    def _persist_unsent_queue(self, *, active_job: _PostJob | None = None) -> None:
+        """Drain any jobs still sitting in the queue straight into the
+        offline queue, bypassing the network and any side effects (e.g. a
+        rating prompt) — shutdown is time-boxed, so the goal is just to not
+        lose the watch.
+
+        Once `_post_abandon` is set, the worker cannot start another queued
+        job. The job it already popped is included too: it may still succeed
+        after being persisted, but `event_id` makes that duplicate replay
+        idempotent and is safer than losing it when the daemon is terminated.
+        Replay order follows each event's timestamp rather than this drain's
+        insertion order."""
+        if self._cache is None:
+            return
+        jobs: list[_PostJob] = []
+        while True:
+            try:
+                job = self._post_queue.get_nowait()
+            except queue.Empty:
+                break
+            if job is not None:
+                jobs.append(job)
+            self._post_queue.task_done()
+        if active_job is not None:
+            jobs.append(active_job)
+        if jobs:
+            self._cache.enqueue_scrobbles([(job.endpoint, job.payload) for job in jobs])
+            xbmc.log(
+                f"[PunchPlay] Persisted {len(jobs)} unsent event(s) to the "
+                "offline queue at shutdown",
+                xbmc.LOGINFO,
             )

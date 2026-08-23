@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 
@@ -260,6 +262,177 @@ class PostLibraryBatchesTests(unittest.TestCase):
         _, _, diagnostics = self._run(_entries(200), api)
 
         self.assertEqual([item["title"] for item in diagnostics], ["A", "B"])
+
+
+class _PullSyncApi:
+    def is_authenticated(self) -> bool:
+        return True
+
+
+class _PullSyncAddon:
+    def getSettingBool(self, key: str) -> bool:
+        return key in ("pull_watched", "pull_resume", "show_notifications")
+
+
+def _pull_sync_summary(**overrides) -> dict[str, int]:
+    base = {
+        "movies_marked": 0,
+        "episodes_marked": 0,
+        "resume_set": 0,
+        "unmatched": 0,
+        "already_synced": 0,
+        "cancelled": 0,
+        "apply_failed": 0,
+    }
+    base.update(overrides)
+    return base
+
+
+class PullSyncCheckpointTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.mkdtemp(prefix="punchplay-pull-sync-tests-")
+        self.cache_module = importlib.import_module("cache")
+        self.original_get_profile_dir = self.cache_module.get_profile_dir
+        self.cache_module.get_profile_dir = lambda: self.temp_dir
+        self.cache = self.cache_module.Cache()
+
+        self.pull_sync_module = importlib.import_module("pull_sync")
+        self.original_run_pull_sync = self.pull_sync_module.run_pull_sync
+
+        self.original_get_addon = service.get_addon
+        service.get_addon = lambda: _PullSyncAddon()
+        self.original_localize = service.localize
+        service.localize = lambda message_id: "{0} {1}"
+
+        # Don't rely on the shared sys.modules["xbmcgui"] mock — test_player.py
+        # unconditionally replaces it without a "DialogProgress" attribute,
+        # and module import order across test files determines which mock
+        # service.py ends up bound to. Swap in a self-contained fake instead.
+        self.notifications: list[tuple] = []
+        self.original_xbmcgui = service.xbmcgui
+        service.xbmcgui = types.SimpleNamespace(
+            NOTIFICATION_INFO="info",
+            NOTIFICATION_WARNING="warning",
+            NOTIFICATION_ERROR="error",
+            Dialog=lambda: types.SimpleNamespace(
+                notification=lambda title, message, icon, timeout=5000: (
+                    self.notifications.append((message, icon))
+                ),
+                yesno=lambda *args, **kwargs: False,
+            ),
+            DialogProgress=lambda: types.SimpleNamespace(
+                create=lambda *args, **kwargs: None,
+                close=lambda: None,
+                update=lambda *args, **kwargs: None,
+                iscanceled=lambda: False,
+            ),
+        )
+
+    def tearDown(self) -> None:
+        self.pull_sync_module.run_pull_sync = self.original_run_pull_sync
+        service.get_addon = self.original_get_addon
+        service.localize = self.original_localize
+        service.xbmcgui = self.original_xbmcgui
+        self.cache_module.get_profile_dir = self.original_get_profile_dir
+        shutil.rmtree(self.temp_dir)
+
+    def _svc(self) -> service.PunchPlayService:
+        svc = service.PunchPlayService.__new__(service.PunchPlayService)
+        svc._api = _PullSyncApi()
+        svc._cache = self.cache
+        svc._live_sync = types.SimpleNamespace(record_pull_applied=lambda applied: None)
+        return svc
+
+    def test_apply_failed_holds_checkpoint_then_advances_after_max_held_runs(self) -> None:
+        self.pull_sync_module.run_pull_sync = (
+            lambda *args, **kwargs: _pull_sync_summary(apply_failed=1)
+        )
+        svc = self._svc()
+        max_held = constants.PULL_SYNC_MAX_HELD_RUNS
+
+        for _ in range(max_held - 1):
+            svc._pull_sync(manual=False)
+            self.assertIsNone(self.cache.get_runtime_status()["last_pull_sync_at"])
+
+        # The run that hits the cap advances the checkpoint anyway, rather
+        # than blocking every future sync behind one permanently-bad item.
+        svc._pull_sync(manual=False)
+        status = self.cache.get_runtime_status()
+        self.assertIsNotNone(status["last_pull_sync_at"])
+        self.assertEqual(status["pull_sync_held_runs"], 0)
+
+    def test_successful_run_resets_held_counter(self) -> None:
+        self.pull_sync_module.run_pull_sync = (
+            lambda *args, **kwargs: _pull_sync_summary(apply_failed=1)
+        )
+        svc = self._svc()
+        svc._pull_sync(manual=False)
+        self.assertEqual(self.cache.get_runtime_status()["pull_sync_held_runs"], 1)
+
+        self.pull_sync_module.run_pull_sync = (
+            lambda *args, **kwargs: _pull_sync_summary(movies_marked=1)
+        )
+        svc._pull_sync(manual=False)
+
+        status = self.cache.get_runtime_status()
+        self.assertIsNotNone(status["last_pull_sync_at"])
+        self.assertEqual(status["pull_sync_held_runs"], 0)
+
+    def test_new_failed_item_gets_its_own_retry_allowance(self) -> None:
+        failures = [
+            {"movie-a"},
+            {"movie-a"},
+            {"movie-a", "movie-b"},
+            {"movie-a", "movie-b"},
+            {"movie-a", "movie-b"},
+        ]
+
+        def _run(*args, **kwargs):
+            _ = args
+            current = failures.pop(0)
+            kwargs["failed_out"].update(current)
+            return _pull_sync_summary(apply_failed=len(current))
+
+        self.pull_sync_module.run_pull_sync = _run
+        svc = self._svc()
+
+        # movie-a has failed three times here, but movie-b has only failed
+        # once, so advancing would silently spend movie-b's retry allowance.
+        for _ in range(3):
+            svc._pull_sync(manual=False)
+        self.assertIsNone(self.cache.get_runtime_status()["last_pull_sync_at"])
+        self.assertEqual(self.cache.get_runtime_status()["pull_sync_held_runs"], 1)
+
+        svc._pull_sync(manual=False)
+        self.assertIsNone(self.cache.get_runtime_status()["last_pull_sync_at"])
+
+        svc._pull_sync(manual=False)
+        self.assertIsNotNone(self.cache.get_runtime_status()["last_pull_sync_at"])
+
+    def test_manual_sync_notification_reflects_apply_failed(self) -> None:
+        self.pull_sync_module.run_pull_sync = (
+            lambda *args, **kwargs: _pull_sync_summary(apply_failed=2)
+        )
+        svc = self._svc()
+
+        svc._pull_sync(manual=True)
+
+        self.assertEqual(len(self.notifications), 1)
+        message, icon = self.notifications[0]
+        self.assertEqual(icon, service.xbmcgui.NOTIFICATION_WARNING)
+        self.assertNotIn("already up to date", message.lower())
+
+    def test_manual_sync_notification_is_success_without_failures(self) -> None:
+        self.pull_sync_module.run_pull_sync = (
+            lambda *args, **kwargs: _pull_sync_summary(movies_marked=1)
+        )
+        svc = self._svc()
+
+        svc._pull_sync(manual=True)
+
+        self.assertEqual(len(self.notifications), 1)
+        _, icon = self.notifications[0]
+        self.assertEqual(icon, service.xbmcgui.NOTIFICATION_INFO)
 
 
 if __name__ == "__main__":

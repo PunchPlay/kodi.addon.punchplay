@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <addon id="script.punchplay"
        name="PunchPlay"
-       version="1.5.1"
+       version="1.5.2"
        provider-name="PunchPlay">
 
   <requires>
@@ -22,7 +22,7 @@
     <forum/>
     <website>https://punchplay.tv</website>
     <source>https://github.com/PunchPlay/kodi.addon.punchplay</source>
-    <news>1.5.1 - Large library imports now run to completion instead of stopping partway, and a sync that hits errors reports how many items were not sent. Scrobbles are sent from a background worker so a slow backend can no longer stall playback, and login polling is friendlier to shared connections.</news>
+    <news>1.5.2 - Fixed concurrent token-refresh 401 errors and watched toggles being suppressed after playback or resume syncs. Pull sync now reports and retries Kodi library write failures without one bad item blocking newer changes. Shutdown preserves queued and in-flight playback events for ordered offline replay.</news>
     <assets>
       <icon>icon.png</icon>
       <fanart>fanart.jpg</fanart>

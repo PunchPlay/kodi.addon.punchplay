@@ -1,3 +1,20 @@
+v1.5.2 (2026-08-23)
+- Fixed intermittent HTTP 401 errors during PunchPlay to Kodi sync. When a
+  playback heartbeat and a manual sync both observed an expired access token,
+  the delayed request could refresh the rotating token chain a second time and
+  invalidate the first request's retry. Delayed 401s now reuse the token that
+  the other thread already refreshed.
+- Fixed manual watched-toggles being silently dropped by live sync's echo
+  suppression. A pull-sync resume-point write (which never touches playcount)
+  no longer suppresses a later watched-toggle, and the "recently played"
+  suppression window was cut from 10 minutes to 30 seconds so it only bridges
+  Kodi's own near-immediate playcount write instead of also swallowing a
+  genuine manual toggle made minutes later.
+- Pull sync now reports Kodi library write failures and retries each failed
+  item without letting one persistently bad item block newer changes forever.
+- Shutdown now preserves both queued and in-flight playback events for ordered
+  offline replay when the network worker cannot finish within its grace period.
+
 v1.5.1 (2026-07-26)
 - Library sync no longer claims success when batches failed. Entries that
   never reached PunchPlay are counted and reported so the run can be

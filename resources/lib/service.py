@@ -41,6 +41,7 @@ from constants import (
     NOTIFICATION_TITLE,
     PRUNE_INTERVAL_SECS,
     PULL_SYNC_INTERVAL_SECS,
+    PULL_SYNC_MAX_HELD_RUNS,
     PULL_SYNC_OVERLAP_SECS,
     SCAN_SYNC_DELAY_SECS,
     SCAN_SYNC_MIN_INTERVAL_SECS,
@@ -503,6 +504,7 @@ class PunchPlayService(xbmc.Monitor):
             return True
 
         applied: set = set()
+        failed_items: set[str] = set()
         try:
             summary = run_pull_sync(
                 self._api,
@@ -511,6 +513,7 @@ class PunchPlayService(xbmc.Monitor):
                 since_ms=since_ms,
                 progress_callback=_progress_callback,
                 applied_out=applied,
+                failed_out=failed_items,
             )
         except Exception as exc:
             if progress is not None:
@@ -532,9 +535,10 @@ class PunchPlayService(xbmc.Monitor):
             self._live_sync.record_pull_applied(applied)
 
         marked = summary["movies_marked"] + summary["episodes_marked"]
+        apply_failed = summary.get("apply_failed") or 0
         summary_text = (
             f"{marked} watched, {summary['resume_set']} resume, "
-            f"{summary['unmatched']} unmatched"
+            f"{summary['unmatched']} unmatched, {apply_failed} failed"
         )
 
         if summary.get("cancelled"):
@@ -550,19 +554,48 @@ class PunchPlayService(xbmc.Monitor):
                 )
             return
 
-        self._cache.record_pull_sync(summary_text)
-        xbmc.log(f"[PunchPlay] Pull sync finished: {summary_text}", xbmc.LOGINFO)
+        if apply_failed:
+            # Some items failed to write to the Kodi library — hold back the
+            # incremental checkpoint so they're retried next time, rather
+            # than letting the next sync's `since` filter treat them as
+            # already covered. But a persistently-failing item must not
+            # block the checkpoint (and every newer item behind it) forever.
+            # Retry counts are tracked per failed item, so only advance once
+            # every item failing on this run has exhausted its own allowance;
+            # a new or unrelated failure always starts at run one.
+            held_runs = self._cache.record_pull_sync_held(failed_items)
+            if held_runs < PULL_SYNC_MAX_HELD_RUNS:
+                xbmc.log(
+                    f"[PunchPlay] Pull sync finished with {apply_failed} apply "
+                    f"failure(s) ({held_runs}/{PULL_SYNC_MAX_HELD_RUNS}), "
+                    f"checkpoint not advanced: {summary_text}",
+                    xbmc.LOGWARNING,
+                )
+            else:
+                xbmc.log(
+                    f"[PunchPlay] Pull sync still has {apply_failed} apply "
+                    f"failure(s) after {held_runs} held run(s) — advancing "
+                    f"checkpoint anyway so future syncs aren't blocked: "
+                    f"{summary_text}",
+                    xbmc.LOGWARNING,
+                )
+                self._cache.record_pull_sync(summary_text)
+        else:
+            self._cache.record_pull_sync(summary_text)
+            xbmc.log(f"[PunchPlay] Pull sync finished: {summary_text}", xbmc.LOGINFO)
 
         changed = marked + summary["resume_set"]
         if manual:
-            message = (
-                _s(32124).format(marked, summary["resume_set"])
-                if changed
-                else _s(32125)
-            )
-            xbmcgui.Dialog().notification(
-                NOTIFICATION_TITLE, message, xbmcgui.NOTIFICATION_INFO, 5000
-            )
+            if apply_failed:
+                message = _s(32137).format(changed, apply_failed)
+                icon = xbmcgui.NOTIFICATION_WARNING
+            elif changed:
+                message = _s(32124).format(marked, summary["resume_set"])
+                icon = xbmcgui.NOTIFICATION_INFO
+            else:
+                message = _s(32125)
+                icon = xbmcgui.NOTIFICATION_INFO
+            xbmcgui.Dialog().notification(NOTIFICATION_TITLE, message, icon, 5000)
         elif changed and get_addon().getSettingBool("show_notifications"):
             xbmcgui.Dialog().notification(
                 NOTIFICATION_TITLE,

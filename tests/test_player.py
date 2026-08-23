@@ -109,6 +109,9 @@ class _FakeAPI:
 
 
 class _FakeCache:
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[str, dict]] = []
+
     def has_rating_suppression(self, key: str) -> bool:
         _ = key
         return False
@@ -118,6 +121,12 @@ class _FakeCache:
 
     def delete_pending_scrobbles_for_session(self, playback_session_id: str) -> None:
         _ = playback_session_id
+
+    def enqueue_scrobble(self, endpoint: str, payload: dict) -> None:
+        self.enqueued.append((endpoint, payload))
+
+    def enqueue_scrobbles(self, items: list[tuple[str, dict]]) -> None:
+        self.enqueued.extend(items)
 
 
 class PlayerHelperTests(unittest.TestCase):
@@ -224,6 +233,24 @@ class PlayerHelperTests(unittest.TestCase):
         player._handle_stop()  # pylint: disable=protected-access
 
         self.assertEqual(calls, ["stop"])
+
+    def test_untracked_stop_still_refreshes_echo_suppression(self) -> None:
+        # An untracked play (identify() failed, or below min_length_minutes)
+        # never sets _metadata, but onAVStarted still remembers the library
+        # item so its playcount echo can be suppressed. _handle_stop must
+        # still refresh that stamp even though nothing was tracked, or the
+        # suppression window can lapse before Kodi's own echo arrives.
+        player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=_FakeCache())
+        calls: list[tuple[str, int]] = []
+        player._stamp_library_item = (  # type: ignore[method-assign]  # pylint: disable=protected-access
+            lambda media_type, dbid: calls.append((media_type, dbid))
+        )
+        player._current_library_item = ("movie", 42)  # pylint: disable=protected-access
+
+        player._handle_stop()  # pylint: disable=protected-access
+
+        self.assertEqual(calls, [("movie", 42)])
+        self.assertIsNone(player._current_library_item)  # pylint: disable=protected-access
 
 
 class _RecordingAPI(_FakeAPI):
@@ -390,6 +417,76 @@ class PostWorkerTests(unittest.TestCase):
 
         # cleanup() joins the worker, so the stop event is already sent.
         self.assertEqual(len(api.posts), 1)
+
+    def test_persist_unsent_queue_drains_to_offline_cache(self) -> None:
+        # Jobs still sitting in the queue when shutdown gives up on the
+        # worker must not just vanish with the abandoned daemon thread.
+        cache = _FakeCache()
+        player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=cache)
+        player._post_queue.put(  # pylint: disable=protected-access
+            player_module._PostJob("/api/scrobble/progress", {"n": 1}, lambda: None)
+        )
+        player._post_queue.put(  # pylint: disable=protected-access
+            player_module._PostJob("/api/scrobble/stop", {"n": 2}, lambda: None)
+        )
+
+        player._persist_unsent_queue()  # pylint: disable=protected-access
+
+        self.assertEqual(
+            cache.enqueued,
+            [("/api/scrobble/progress", {"n": 1}), ("/api/scrobble/stop", {"n": 2})],
+        )
+        self.assertEqual(player._post_queue.qsize(), 0)  # pylint: disable=protected-access
+
+    def test_cleanup_persists_the_in_flight_job_after_timeout(self) -> None:
+        block = threading.Event()
+        api = _RecordingAPI(block=block)
+        cache = _FakeCache()
+        player = player_module.PunchPlayPlayer(api=api, cache=cache)
+        original_timeout = player_module.POST_WORKER_JOIN_TIMEOUT_SECS
+        player_module.POST_WORKER_JOIN_TIMEOUT_SECS = 0.01
+        worker = None
+        try:
+            payload = {"event_id": "stop-1", "event_created_at": 1000}
+            player._dispatch_post("/api/scrobble/stop", payload)
+            self.assertTrue(api.entered.wait(1))
+            worker = player._post_thread  # pylint: disable=protected-access
+
+            player.cleanup()
+
+            self.assertIn(("/api/scrobble/stop", payload), cache.enqueued)
+        finally:
+            block.set()
+            if worker is not None:
+                worker.join(timeout=1)
+            player_module.POST_WORKER_JOIN_TIMEOUT_SECS = original_timeout
+
+    def test_cleanup_persists_backlog_when_shutdown_sentinel_queue_is_full(self) -> None:
+        block = threading.Event()
+        api = _RecordingAPI(block=block)
+        cache = _FakeCache()
+        player = player_module.PunchPlayPlayer(api=api, cache=cache)
+        player._post_queue = queue.Queue(maxsize=1)  # pylint: disable=protected-access
+        original_timeout = player_module.POST_WORKER_JOIN_TIMEOUT_SECS
+        player_module.POST_WORKER_JOIN_TIMEOUT_SECS = 0.01
+        worker = None
+        try:
+            active = {"event_id": "progress-1", "event_created_at": 1000}
+            queued = {"event_id": "stop-1", "event_created_at": 2000}
+            player._dispatch_post("/api/scrobble/progress", active)
+            self.assertTrue(api.entered.wait(1))
+            player._dispatch_post("/api/scrobble/stop", queued)
+            worker = player._post_thread  # pylint: disable=protected-access
+
+            player.cleanup()
+
+            persisted_ids = {payload["event_id"] for _, payload in cache.enqueued}
+            self.assertEqual(persisted_ids, {"progress-1", "stop-1"})
+        finally:
+            block.set()
+            if worker is not None:
+                worker.join(timeout=1)
+            player_module.POST_WORKER_JOIN_TIMEOUT_SECS = original_timeout
 
 
 if __name__ == "__main__":

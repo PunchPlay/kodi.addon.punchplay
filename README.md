@@ -4,6 +4,15 @@ PunchPlay is a background service addon that tracks movies and TV episodes you w
 
 It supports Kodi Nexus 20 and Omega 21.
 
+## What's New In 1.5.2
+
+- Fixed intermittent HTTP 401 errors during PunchPlay to Kodi sync when playback and the service refreshed an expired token at the same time.
+- Fixed live watched toggles being suppressed after resume syncs or for too long after playback.
+- Pull sync now reports and retries Kodi library write failures without allowing one bad item to block the checkpoint forever.
+- Kodi shutdown now preserves queued and in-flight playback events for correctly ordered offline replay.
+
+1.5.1 improved large-library imports, moved scrobbles off Kodi's player callback thread, and made device-code login friendlier to shared connections.
+
 ## What's New In 1.5.1
 
 - Large library imports now run to completion. Previously a full sync stopped being accepted after roughly 5,000 items and still reported success, silently dropping the rest.
