@@ -281,6 +281,11 @@ class PunchPlayService(xbmc.Monitor):
         last_identify = snapshot.get("last_identify_status") or _s(32070)
         if snapshot.get("last_identify_title"):
             last_identify = "{0} — {1}".format(last_identify, snapshot["last_identify_title"])
+        rating_scope = (
+            _s(32140)
+            if snapshot.get("rating_prompt_scope") == "movies"
+            else _s(32141)
+        )
 
         lines = [
             _s(32060).format(status_label),
@@ -296,6 +301,7 @@ class PunchPlayService(xbmc.Monitor):
             _s(32066).format(last_success),
             _s(32067).format(last_error),
             _s(32127).format(self._format_pull_sync_status(snapshot)),
+            _s(32142).format(rating_scope),
             _s(32068).format(snapshot.get("addon_version") or _s(32071)),
             _s(32069).format(snapshot.get("kodi_version") or _s(32071)),
         ]

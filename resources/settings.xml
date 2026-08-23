@@ -29,6 +29,7 @@
 
   <category label="32048">
     <setting id="rate_after_watching" type="bool" label="32020" default="true"/>
+    <setting id="rating_prompt_scope" type="enum" label="32139" lvalues="32140|32141" default="1"/>
     <setting id="rating_prompt_delay" type="number" label="32110" default="2"/>
     <setting id="clear_rating_suppressions" type="action" label="32129" action="SetProperty(punchplay_clear_suppressions,1,10000)" option="action"/>
   </category>

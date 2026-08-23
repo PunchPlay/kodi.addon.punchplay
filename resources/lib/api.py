@@ -1267,12 +1267,22 @@ class APIClient:
             "last_identify_confidence": runtime_status.get("last_identify_confidence"),
             "last_pull_sync_at": runtime_status.get("last_pull_sync_at"),
             "last_pull_sync_summary": runtime_status.get("last_pull_sync_summary"),
+            "rating_prompt_scope": self._rating_prompt_scope(),
             "identifier_cache_size": identifier_cache_size,
             "addon_version": self._client_version,
             "kodi_version": xbmc.getInfoLabel("System.BuildVersion") or localize(32071),
             "platform": platform.platform(),
             "python_version": sys.version.split()[0],
         }
+
+    def _rating_prompt_scope(self) -> str:
+        setting = get_addon().getSetting("rating_prompt_scope") or "1"
+        return {
+            "0": "movies",
+            "1": "all",
+            "movies": "movies",
+            "all": "all",
+        }.get(setting, "all")
 
     def _settings_summary(self) -> dict[str, Any]:
         addon = get_addon()
@@ -1294,6 +1304,7 @@ class APIClient:
             "min_length_minutes": addon.getSettingInt("min_length"),
             "heartbeat_interval": HEARTBEAT_INTERVAL_SECS,
             "rate_after_watching": addon.getSettingBool("rate_after_watching"),
+            "rating_prompt_scope": self._rating_prompt_scope(),
             "rating_prompt_delay_secs": addon.getSettingInt("rating_prompt_delay"),
             "show_notifications": addon.getSettingBool("show_notifications"),
             "notify_during_playback": addon.getSettingBool("notify_during_playback"),

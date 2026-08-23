@@ -233,6 +233,38 @@ class PlayerHelperTests(unittest.TestCase):
 
         self.assertIsNone(player._pending_rating)  # pylint: disable=protected-access
 
+    def test_movies_only_scope_skips_episode_rating_prompt(self) -> None:
+        player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=_FakeCache())
+
+        player._queue_rating_prompt(  # pylint: disable=protected-access
+            {
+                "media_type": "episode",
+                "title": "Breaking Bad",
+                "season": 1,
+                "episode": 2,
+                "tmdb_id": 62085,
+            },
+            {"rating_prompt_delay": 0, "rating_prompt_scope": "movies"},
+            stop_resp={},
+        )
+
+        self.assertIsNone(player._pending_rating)  # pylint: disable=protected-access
+
+    def test_movies_only_scope_still_queues_movie_rating_prompt(self) -> None:
+        player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=_FakeCache())
+
+        player._queue_rating_prompt(  # pylint: disable=protected-access
+            {
+                "media_type": "movie",
+                "title": "Inception",
+                "tmdb_id": 27205,
+            },
+            {"rating_prompt_delay": 0, "rating_prompt_scope": "movies"},
+            stop_resp={},
+        )
+
+        self.assertIsNotNone(player._pending_rating)  # pylint: disable=protected-access
+
     def test_duplicate_stop_guard_emits_stop_once(self) -> None:
         player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=_FakeCache())
         calls: list[str] = []

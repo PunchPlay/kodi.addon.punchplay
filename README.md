@@ -11,6 +11,7 @@ It supports Kodi Nexus 20 and Omega 21.
 - Pull sync now reports and retries Kodi library write failures without allowing one bad item to block the checkpoint forever, and resets incremental state when the account or enabled sync halves change.
 - Kodi shutdown now preserves queued and in-flight playback events for correctly ordered offline replay.
 - Logout now discards old-account work still in memory, and device-code pollers no longer race after the QR window is dismissed.
+- Rating prompts can now be limited to movies while episode scrobbling continues normally.
 
 1.5.1 improved large-library imports, moved scrobbles off Kodi's player callback thread, and made device-code login friendlier to shared connections.
 
@@ -101,6 +102,7 @@ Open **Configure** from the addon details page.
 | Auto-sync from PunchPlay every 6 hours | Off | Runs an incremental pull sync in the background. |
 | Sync From PunchPlay Now | - | Applies PunchPlay watched history and resume points to the Kodi library. |
 | Rate after watching | On | Shows the PunchPlay rating dialog after a completed scrobble. |
+| Rating prompts for | Movies and episodes | Choose whether completed episodes should also show a rating prompt. |
 | Rating prompt delay (seconds) | 2 | Lets Kodi settle before prompting, which avoids interrupting autoplay. |
 | Clear Rating Prompt Suppressions | - | Undoes previous "Never for this title/show" choices. |
 | Show scrobble notifications | On | Shows Kodi notifications for completed scrobbles. |
@@ -181,6 +183,7 @@ Notes:
 - offline queue size and queued endpoint summary
 - last successful scrobble and last error
 - identifier cache size and last identify result
+- configured movie/episode rating-prompt scope
 - addon version, Kodi version, platform, and Python version in debug export
 
 Basic debug export avoids tokens and file paths. Verbose debug export warns before including queued file paths.

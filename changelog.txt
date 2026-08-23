@@ -17,7 +17,9 @@ v1.5.2 (2026-08-23)
   offline replay when the network worker cannot finish within its grace period.
 - Logout discards queued and in-flight work from the previous account, and QR
   login no longer lets its background and fallback pollers race for a token.
-- \"Never for this show\" rating suppression now applies to every episode.
+- "Never for this show" rating suppression now applies to every episode.
+- Rating prompts can now be limited to movies without disabling episode
+  scrobbling or watched sync.
 
 v1.5.1 (2026-07-26)
 - Library sync no longer claims success when batches failed. Entries that

@@ -164,6 +164,13 @@ class PunchPlayPlayer(xbmc.Player):
             "season_episode": "season_episode",
             "absolute": "absolute",
         }
+        rating_scope_setting = addon.getSetting("rating_prompt_scope") or "1"
+        rating_scope_map = {
+            "0": "movies",
+            "1": "all",
+            "movies": "movies",
+            "all": "all",
+        }
         return {
             "watched_threshold": addon.getSettingInt("watched_threshold") / 100.0,
             "min_length_secs": addon.getSettingInt("min_length") * 60,
@@ -175,6 +182,10 @@ class PunchPlayPlayer(xbmc.Player):
             "show_notifications": addon.getSettingBool("show_notifications"),
             "notify_during_playback": addon.getSettingBool("notify_during_playback"),
             "rate_after_watching": addon.getSettingBool("rate_after_watching"),
+            "rating_prompt_scope": rating_scope_map.get(
+                rating_scope_setting,
+                "all",
+            ),
             "rating_prompt_delay": addon.getSettingInt("rating_prompt_delay"),
         }
 
@@ -741,6 +752,15 @@ class PunchPlayPlayer(xbmc.Player):
         stop_resp: dict[str, Any] | None,
     ) -> None:
         """Store a pending rating request for the service loop to pick up."""
+        if (
+            metadata.get("media_type") == "episode"
+            and settings.get("rating_prompt_scope", "all") == "movies"
+        ):
+            xbmc.log(
+                "[PunchPlay] Skipping episode rating — prompts limited to movies",
+                xbmc.LOGINFO,
+            )
+            return
         if stop_resp is None and not has_reliable_rating_identity(metadata):
             xbmc.log("[PunchPlay] Skipping rating — no reliable canonical ID", xbmc.LOGINFO)
             return
