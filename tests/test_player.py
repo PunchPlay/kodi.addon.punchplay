@@ -276,7 +276,8 @@ class _RecordingAPI(_FakeAPI):
         self.entered = threading.Event()
         self.stop_response: dict = {}
 
-    def post(self, endpoint, payload):
+    def post(self, endpoint, payload, *, expected_auth_generation=None):
+        _ = expected_auth_generation
         self.entered.set()
         if self.block is not None:
             self.block.wait(5)

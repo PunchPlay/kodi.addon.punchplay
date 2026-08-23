@@ -375,7 +375,11 @@ class PunchPlayPlayer(xbmc.Player):
                 endpoint,
                 payload,
                 auth_generation,
-                lambda: self._api.post(endpoint, payload),
+                lambda: self._api.post(
+                    endpoint,
+                    payload,
+                    expected_auth_generation=auth_generation,
+                ),
             )
         )
 
@@ -625,7 +629,11 @@ class PunchPlayPlayer(xbmc.Player):
         if session_id and self._cache is not None:
             self._cache.delete_pending_scrobbles_for_session(session_id)
 
-        stop_resp = self._api.post(SCROBBLE_STOP_ENDPOINT, payload)
+        stop_resp = self._api.post(
+            SCROBBLE_STOP_ENDPOINT,
+            payload,
+            expected_auth_generation=auth_generation,
+        )
 
         # logout() invalidates all work from the previous account. The HTTP
         # request may already have completed, but its response must not create

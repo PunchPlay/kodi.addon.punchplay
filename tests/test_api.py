@@ -463,6 +463,72 @@ class LogoutGenerationTests(unittest.TestCase):
         self.assertTrue(self.cache.queue_cleared)
         self.assertEqual(self.cache.enqueued, [])
 
+    def test_delayed_401_cannot_retry_old_post_with_new_account_token(self) -> None:
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args) -> None:
+                _ = args
+
+            def read(self) -> bytes:
+                return b'{"ok":true}'
+
+        old_request_started = threading.Event()
+        release_old_request = threading.Event()
+        authorizations: list[str | None] = []
+
+        def _urlopen(request, timeout=0):
+            _ = timeout
+            authorization = request.headers.get("Authorization")
+            authorizations.append(authorization)
+            if authorization == "Bearer old-account-access":
+                old_request_started.set()
+                release_old_request.wait(2)
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    401,
+                    "Unauthorized",
+                    {},
+                    io.BytesIO(b'{"message":"Unauthorized"}'),
+                )
+            if authorization == "Bearer new-account-access":
+                return _Response()
+            raise AssertionError(f"unexpected authorization: {authorization!r}")
+
+        original_urlopen = api_module.urllib.request.urlopen
+        self.addCleanup(
+            setattr,
+            api_module.urllib.request,
+            "urlopen",
+            original_urlopen,
+        )
+        api_module.urllib.request.urlopen = _urlopen
+
+        result: list[dict[str, str] | None] = []
+        worker = threading.Thread(
+            target=lambda: result.append(
+                self.client.post("/api/scrobble/stop", {"event_id": "old-event"})
+            )
+        )
+        worker.start()
+        self.assertTrue(old_request_started.wait(1))
+
+        self.assertTrue(self.client.logout())
+        self.client._save_tokens(  # pylint: disable=protected-access
+            {
+                "access_token": "new-account-access",
+                "refresh_token": "new-account-refresh",
+            }
+        )
+        release_old_request.set()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [None])
+        self.assertEqual(authorizations, ["Bearer old-account-access"])
+        self.assertEqual(self.cache.enqueued, [])
+
 
 if __name__ == "__main__":
     unittest.main()

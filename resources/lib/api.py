@@ -61,6 +61,10 @@ class BackendConfigurationError(ValueError):
     """Raised when the configured backend URL is unsafe or malformed."""
 
 
+class AuthenticationChangedError(RuntimeError):
+    """Raised when a request outlives the login generation that created it."""
+
+
 def _retry_after_seconds(exc: urllib.error.HTTPError, default: int) -> int:
     """Read a Retry-After header, clamped to a sane polling range."""
     try:
@@ -459,19 +463,32 @@ class APIClient:
         *,
         retry_on_401: bool = True,
         timeout: int = REQUEST_TIMEOUT_SECS,
+        expected_auth_generation: int | None = None,
     ) -> dict[str, Any]:
         """
         Perform an HTTP request.  Returns the parsed JSON body.
         Raises ConnectionError on network failure, urllib.error.HTTPError on
         non-2xx responses.
         """
-        url = f"{self._base_url()}{path}"
-        body = json.dumps(payload).encode("utf-8") if payload is not None else None
         # Keep the credential that is actually sent with this request.  A
         # different thread may rotate the token while this request is in
         # flight; in that case its 401 must reuse the newer token rather than
-        # rotating the refresh chain a second time.
-        access_token_at_request = self._tokens.get("access_token")
+        # rotating the refresh chain a second time. Pair the token with the
+        # account generation under the refresh/logout lock so an old payload
+        # can never pick up credentials from a later login.
+        with self._refresh_lock:
+            auth_generation_at_request = self._auth_generation
+            if (
+                expected_auth_generation is not None
+                and expected_auth_generation != auth_generation_at_request
+            ):
+                raise AuthenticationChangedError(
+                    "Login changed before request could be sent"
+                )
+            access_token_at_request = self._tokens.get("access_token")
+
+        url = f"{self._base_url()}{path}"
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
         req = urllib.request.Request(
             url,
             data=body,
@@ -486,9 +503,17 @@ class APIClient:
         except urllib.error.HTTPError as exc:
             if exc.code == 401 and retry_on_401:
                 xbmc.log("[PunchPlay] 401 — attempting token refresh", xbmc.LOGDEBUG)
-                if self._do_refresh(access_token_at_request):
+                if self._do_refresh(
+                    access_token_at_request,
+                    auth_generation_at_request,
+                ):
                     return self._request(
-                        method, path, payload, retry_on_401=False, timeout=timeout
+                        method,
+                        path,
+                        payload,
+                        retry_on_401=False,
+                        timeout=timeout,
+                        expected_auth_generation=auth_generation_at_request,
                     )
             raise
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
@@ -498,8 +523,16 @@ class APIClient:
     # Token refresh
     # ------------------------------------------------------------------
 
-    def _do_refresh(self, stale_access_token: str | None) -> bool:
+    def _do_refresh(
+        self,
+        stale_access_token: str | None,
+        expected_auth_generation: int,
+    ) -> bool:
         with self._refresh_lock:
+            if self._auth_generation != expected_auth_generation:
+                raise AuthenticationChangedError(
+                    "Login changed while request was in flight"
+                )
             # The request that produced the 401 may have been sent before
             # another thread refreshed successfully.  Reuse that refresh
             # result; refreshing again rotates the backend's access token and
@@ -545,13 +578,23 @@ class APIClient:
     def _is_permanent_client_error(self, status_code: int) -> bool:
         return status_code in PERMANENT_HTTP_STATUS_CODES
 
-    def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    def post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        expected_auth_generation: int | None = None,
+    ) -> dict[str, Any] | None:
         """
         POST *payload* to *path*.  On network error, writes the event to the
         offline queue — never silently drops it.  Returns the response dict on
         success, or None when the request was queued.
         """
-        auth_generation = self._auth_generation
+        auth_generation = (
+            self._auth_generation
+            if expected_auth_generation is None
+            else expected_auth_generation
+        )
 
         def _discarded_by_logout() -> bool:
             if self._auth_generation == auth_generation:
@@ -563,9 +606,20 @@ class APIClient:
             return True
 
         try:
-            result = self._request("POST", path, payload)
+            result = self._request(
+                "POST",
+                path,
+                payload,
+                expected_auth_generation=auth_generation,
+            )
             self._record_success(path, payload)
             return result
+        except AuthenticationChangedError:
+            xbmc.log(
+                f"[PunchPlay] Discarding {path} after the login changed",
+                xbmc.LOGDEBUG,
+            )
+            return None
         except BackendConfigurationError as exc:
             if _discarded_by_logout():
                 return None
