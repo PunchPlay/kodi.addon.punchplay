@@ -158,6 +158,10 @@ class APIClient:
 
         self._tokens: dict[str, str] = self._load_tokens()
         self.device_id: str = self._get_or_create_device_id()
+        # Incremented whenever the user logs out. Playback posts snapshot this
+        # value so work created for one account can never be queued or replayed
+        # after a later login to another account.
+        self._auth_generation = 0
 
         # Guards _do_refresh: the heartbeat thread and the service thread can
         # both hit a 401 at the same time, and concurrent refreshes with a
@@ -215,6 +219,10 @@ class APIClient:
             self._cache.record_error(message)
         except Exception as exc:
             xbmc.log(f"[PunchPlay] Status error update failed: {exc}", xbmc.LOGDEBUG)
+
+    @property
+    def auth_generation(self) -> int:
+        return self._auth_generation
 
     def _record_identify_result(
         self,
@@ -543,11 +551,24 @@ class APIClient:
         offline queue — never silently drops it.  Returns the response dict on
         success, or None when the request was queued.
         """
+        auth_generation = self._auth_generation
+
+        def _discarded_by_logout() -> bool:
+            if self._auth_generation == auth_generation:
+                return False
+            xbmc.log(
+                f"[PunchPlay] Discarding {path} from a logged-out account",
+                xbmc.LOGDEBUG,
+            )
+            return True
+
         try:
             result = self._request("POST", path, payload)
             self._record_success(path, payload)
             return result
         except BackendConfigurationError as exc:
+            if _discarded_by_logout():
+                return None
             xbmc.log(
                 f"[PunchPlay] Backend URL invalid ({exc}) — preserving {path}",
                 xbmc.LOGWARNING,
@@ -557,6 +578,8 @@ class APIClient:
                 self._cache.enqueue_scrobble(path, payload)
             return None
         except ConnectionError as exc:
+            if _discarded_by_logout():
+                return None
             xbmc.log(
                 f"[PunchPlay] Network error ({exc}) — queuing {path}", xbmc.LOGWARNING
             )
@@ -565,6 +588,8 @@ class APIClient:
                 self._cache.enqueue_scrobble(path, payload)
             return None
         except urllib.error.HTTPError as exc:
+            if _discarded_by_logout():
+                return None
             if 500 <= exc.code < 600:
                 # Transient server error — queue for retry.
                 xbmc.log(
@@ -613,7 +638,7 @@ class APIClient:
     # ------------------------------------------------------------------
 
     def flush_queue(self) -> None:
-        """Replay pending offline scrobbles in insertion order."""
+        """Replay pending offline scrobbles in playback-event order."""
         if self._cache is None:
             return
         expired = self._cache.drop_expired_pending_scrobbles()
@@ -841,8 +866,13 @@ class APIClient:
             login_dialog.doModal()
 
             # Dialog closed — either by approve() or by the user.
+            login_dialog.mark_closed()
             stop_event.set()
-            thread.join(timeout=3)
+            # The request is bounded by REQUEST_TIMEOUT_SECS. Wait for that
+            # one outstanding poll to finish before starting the fallback
+            # poller: device tokens are one-time credentials, so two pollers
+            # must never race to consume the successful response.
+            thread.join()
 
             approved = login_dialog.was_approved
             del login_dialog
@@ -1065,16 +1095,28 @@ class APIClient:
             if not confirmed:
                 return False
 
-        if os.path.exists(self._token_file):
-            os.remove(self._token_file)
-        self._tokens = {}
+        # Serialize with token refresh. A refresh already in flight finishes
+        # first and is then cleared; a refresh arriving later sees no token.
+        # Increment the account generation before clearing persistence so an
+        # in-flight playback request cannot repopulate the queue afterward.
+        with self._refresh_lock:
+            self._auth_generation += 1
+            if os.path.exists(self._token_file):
+                os.remove(self._token_file)
+            self._tokens = {}
         if self._cache is not None:
             try:
                 self._cache.clear_pending_scrobbles()
-                self._cache.set_account_username(None)
                 xbmc.log("[PunchPlay] Offline queue cleared on logout", xbmc.LOGDEBUG)
             except Exception as exc:
                 xbmc.log(f"[PunchPlay] Queue clear error: {exc}", xbmc.LOGDEBUG)
+            try:
+                # Keep account/checkpoint invalidation independent of queue
+                # cleanup so one SQLite failure cannot leak the old account's
+                # incremental pull-sync position into the next login.
+                self._cache.set_account_username(None)
+            except Exception as exc:
+                xbmc.log(f"[PunchPlay] Account-state clear error: {exc}", xbmc.LOGDEBUG)
         xbmc.log("[PunchPlay] Tokens cleared (logged out)", xbmc.LOGINFO)
         xbmcgui.Dialog().notification(
             NOTIFICATION_TITLE, localize(32012),

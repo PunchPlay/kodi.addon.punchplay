@@ -158,6 +158,58 @@ class LiveWatchedSyncTests(unittest.TestCase):
         # Suppressed events are consumed, not retried forever.
         self.assertEqual(sync.pending_count(), 0)
 
+    def test_later_manual_watch_is_not_suppressed_by_recent_playback(self) -> None:
+        import time as _time
+
+        sync = library_events.LiveWatchedSync()
+        played_at = _time.monotonic() - library_events.LIVE_SYNC_ECHO_MATCH_SECS - 1
+        self._push(sync, id=7, type="episode", playcount=1)
+
+        due = sync.pop_due_events(
+            [("episode", 7, played_at)],
+            now=_time.monotonic() + library_events.LIVE_SYNC_DEBOUNCE_SECS + 1,
+        )
+
+        self.assertEqual([event["library_id"] for event in due], [7])
+
+    def test_later_manual_watch_is_not_suppressed_by_pull_sync(self) -> None:
+        import time as _time
+
+        sync = library_events.LiveWatchedSync()
+        sync._pull_applied[("movie", 8)] = (  # pylint: disable=protected-access
+            _time.monotonic() - library_events.LIVE_SYNC_ECHO_MATCH_SECS - 1
+        )
+        self._push(sync, id=8, type="movie", playcount=1)
+
+        due = sync.pop_due_events(
+            [], now=_time.monotonic() + library_events.LIVE_SYNC_DEBOUNCE_SECS + 1
+        )
+
+        self.assertEqual([event["library_id"] for event in due], [8])
+
+    def test_requeued_event_waits_for_debounce_and_keeps_newer_update(self) -> None:
+        import time as _time
+
+        sync = library_events.LiveWatchedSync()
+        self._push(sync, id=7, type="movie", playcount=1)
+        due = sync.pop_due_events(
+            [], now=_time.monotonic() + library_events.LIVE_SYNC_DEBOUNCE_SECS + 1
+        )
+        sync.requeue_events(due)
+
+        self.assertEqual(sync.pop_due_events([]), [])
+        self.assertEqual(sync.pending_count(), 1)
+
+        # A new Kodi update for the same item replaces the retry. Requeueing
+        # the older event again must not overwrite the newer playcount.
+        self._push(sync, id=7, type="movie", playcount=3)
+        sync.requeue_events(due)
+        retried = sync.pop_due_events(
+            [], now=_time.monotonic() + library_events.LIVE_SYNC_DETAIL_RETRY_SECS + 1
+        )
+        self.assertEqual(len(retried), 1)
+        self.assertEqual(retried[0]["playcount"], 3)
+
 
 class BuildImportEntryTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -228,6 +280,16 @@ class BuildImportEntryTests(unittest.TestCase):
                 {"item_type": "movie", "library_id": 5, "playcount": 1}
             )
         )
+
+    def test_transient_detail_failure_is_retryable(self) -> None:
+        library_events._rpc = lambda method, params: (_ for _ in ()).throw(
+            RuntimeError("Kodi JSON-RPC unavailable")
+        )
+
+        with self.assertRaises(library_events.LibraryDetailLookupError):
+            library_events.build_import_entry(
+                {"item_type": "movie", "library_id": 5, "playcount": 1}
+            )
 
 
 if __name__ == "__main__":

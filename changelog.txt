@@ -6,14 +6,18 @@ v1.5.2 (2026-08-23)
   the other thread already refreshed.
 - Fixed manual watched-toggles being silently dropped by live sync's echo
   suppression. A pull-sync resume-point write (which never touches playcount)
-  no longer suppresses a later watched-toggle, and the "recently played"
-  suppression window was cut from 10 minutes to 30 seconds so it only bridges
-  Kodi's own near-immediate playcount write instead of also swallowing a
-  genuine manual toggle made minutes later.
+  no longer suppresses a later watched-toggle, and playback/pull echoes now
+  match the timestamp of the Kodi write instead of swallowing every manual
+  toggle for the same title during a blanket time window. Transient Kodi
+  detail lookup failures are requeued rather than losing the toggle.
 - Pull sync now reports Kodi library write failures and retries each failed
   item without letting one persistently bad item block newer changes forever.
+  Incremental checkpoints now reset after an account or enabled-setting change.
 - Shutdown now preserves both queued and in-flight playback events for ordered
   offline replay when the network worker cannot finish within its grace period.
+- Logout discards queued and in-flight work from the previous account, and QR
+  login no longer lets its background and fallback pollers race for a token.
+- \"Never for this show\" rating suppression now applies to every episode.
 
 v1.5.1 (2026-07-26)
 - Library sync no longer claims success when batches failed. Entries that

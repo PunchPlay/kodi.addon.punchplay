@@ -106,6 +106,8 @@ class _FakeCache:
     def __init__(self) -> None:
         self.store: dict[str, dict[str, object]] = {}
         self.identify_results: list[tuple[str, str, float | None]] = []
+        self.enqueued: list[tuple[str, dict[str, object]]] = []
+        self.queue_cleared = False
 
     def get_identifier(self, key: str) -> dict[str, object] | None:
         return self.store.get(key)
@@ -128,6 +130,19 @@ class _FakeCache:
 
     def record_success(self, endpoint: str, title: str = "") -> None:
         _ = endpoint, title
+
+    def enqueue_scrobble(self, endpoint: str, payload: dict[str, object]) -> None:
+        self.enqueued.append((endpoint, payload))
+
+    def get_queue_summary(self) -> dict[str, int]:
+        return {"count": len(self.enqueued)}
+
+    def clear_pending_scrobbles(self) -> None:
+        self.enqueued = []
+        self.queue_cleared = True
+
+    def set_account_username(self, username: str | None) -> None:
+        _ = username
 
 
 class APIValidationTests(unittest.TestCase):
@@ -282,9 +297,11 @@ class TokenRefreshTests(unittest.TestCase):
         self.original_get_addon = api_module.get_addon
         self.original_get_profile_dir = api_module.get_profile_dir
         self.original_get_addon_version = api_module.get_addon_version
+        self.original_localize = api_module.localize
         api_module.get_addon = lambda: self.fake_addon
         api_module.get_profile_dir = lambda: self.temp_dir
         api_module.get_addon_version = lambda: "1.5.2"
+        api_module.localize = lambda message_id: str(message_id)
         self.client = api_module.APIClient()
         self.client._tokens = {
             "access_token": "expired-access",
@@ -295,6 +312,7 @@ class TokenRefreshTests(unittest.TestCase):
         api_module.get_addon = self.original_get_addon
         api_module.get_profile_dir = self.original_get_profile_dir
         api_module.get_addon_version = self.original_get_addon_version
+        api_module.localize = self.original_localize
         shutil.rmtree(self.temp_dir)
 
     def test_in_flight_401_reuses_token_rotated_by_another_thread(self) -> None:
@@ -387,6 +405,63 @@ class TokenRefreshTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(results), 2)
         self.assertEqual(refresh_tokens, ["refresh-1"])
+
+
+class LogoutGenerationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.mkdtemp(prefix="punchplay-logout-tests-")
+        self.fake_addon = _FakeAddon()
+        self.original_get_addon = api_module.get_addon
+        self.original_get_profile_dir = api_module.get_profile_dir
+        self.original_get_addon_version = api_module.get_addon_version
+        self.original_localize = api_module.localize
+        api_module.get_addon = lambda: self.fake_addon
+        api_module.get_profile_dir = lambda: self.temp_dir
+        api_module.get_addon_version = lambda: "1.5.2"
+        api_module.localize = lambda message_id: str(message_id)
+        self.cache = _FakeCache()
+        self.client = api_module.APIClient(cache=self.cache)
+        self.client._tokens = {  # pylint: disable=protected-access
+            "access_token": "old-account-access",
+            "refresh_token": "old-account-refresh",
+        }
+
+    def tearDown(self) -> None:
+        api_module.get_addon = self.original_get_addon
+        api_module.get_profile_dir = self.original_get_profile_dir
+        api_module.get_addon_version = self.original_get_addon_version
+        api_module.localize = self.original_localize
+        shutil.rmtree(self.temp_dir)
+
+    def test_logout_prevents_in_flight_post_from_repopulating_queue(self) -> None:
+        request_started = threading.Event()
+        release_request = threading.Event()
+
+        def _slow_failure(*args, **kwargs):
+            _ = args, kwargs
+            request_started.set()
+            release_request.wait(2)
+            raise ConnectionError("offline")
+
+        self.client._request = _slow_failure  # type: ignore[method-assign]
+        result: list[dict[str, str] | None] = []
+        worker = threading.Thread(
+            target=lambda: result.append(
+                self.client.post("/api/scrobble/stop", {"event_id": "old-event"})
+            )
+        )
+        worker.start()
+        self.assertTrue(request_started.wait(1))
+
+        self.assertTrue(self.client.logout())
+        self.assertEqual(self.client.auth_generation, 1)
+        release_request.set()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [None])
+        self.assertTrue(self.cache.queue_cleared)
+        self.assertEqual(self.cache.enqueued, [])
 
 
 if __name__ == "__main__":

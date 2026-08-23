@@ -74,8 +74,10 @@ def build_rating_suppression_keys(metadata: dict[str, Any]) -> dict[str, str]:
         )
     }
     if media_type == "episode":
-        keys["show"] = "show:{0}:{1}:{2}".format(
-            canonical_id or title,
+        # Episode IDs differ from one episode to the next, so they cannot
+        # identify a show-wide suppression. The normalised show title/year is
+        # stable across its episodes and still distinguishes most remakes.
+        keys["show"] = "show:{0}:{1}".format(
             title,
             year,
         )
@@ -93,6 +95,7 @@ class _PostJob(NamedTuple):
 
     endpoint: str
     payload: dict[str, Any]
+    auth_generation: int
     run: Callable[[], None]
 
 
@@ -107,6 +110,7 @@ class PunchPlayPlayer(xbmc.Player):
         self._metadata: dict[str, Any] | None = None
         self._is_playing: bool = False
         self._playback_session_id: str | None = None
+        self._playback_auth_generation: int | None = None
         self._stop_emitted: bool = False
 
         # Last known playback position — used as fallback in _emit_stop when
@@ -326,7 +330,14 @@ class PunchPlayPlayer(xbmc.Player):
                 self._post_queue.task_done()
                 return
             try:
-                job.run()
+                if job.auth_generation != self._api.auth_generation:
+                    xbmc.log(
+                        f"[PunchPlay] Discarding stale queued post {job.endpoint} "
+                        "after logout",
+                        xbmc.LOGDEBUG,
+                    )
+                else:
+                    job.run()
             except Exception as exc:
                 xbmc.log(f"[PunchPlay] Post worker error: {exc}", xbmc.LOGWARNING)
             finally:
@@ -352,7 +363,21 @@ class PunchPlayPlayer(xbmc.Player):
             )
 
     def _dispatch_post(self, endpoint: str, payload: dict[str, Any]) -> None:
-        self._dispatch(_PostJob(endpoint, payload, lambda: self._api.post(endpoint, payload)))
+        auth_generation = self._playback_auth_generation
+        if auth_generation is None:
+            xbmc.log(
+                f"[PunchPlay] Discarding {endpoint} without an active login session",
+                xbmc.LOGDEBUG,
+            )
+            return
+        self._dispatch(
+            _PostJob(
+                endpoint,
+                payload,
+                auth_generation,
+                lambda: self._api.post(endpoint, payload),
+            )
+        )
 
     # ------------------------------------------------------------------
     # Heartbeat thread
@@ -440,6 +465,7 @@ class PunchPlayPlayer(xbmc.Player):
 
             if not self._api.is_authenticated():
                 return
+            auth_generation = self._api.auth_generation
 
             settings = self._settings()
 
@@ -491,9 +517,22 @@ class PunchPlayPlayer(xbmc.Player):
                 )
                 return
 
+            # Identification can involve network I/O. If the user logged out
+            # while it was running, do not start a session for the old account.
+            if (
+                auth_generation != self._api.auth_generation
+                or not self._api.is_authenticated()
+            ):
+                xbmc.log(
+                    "[PunchPlay] Login changed during identification — skipping",
+                    xbmc.LOGDEBUG,
+                )
+                return
+
             self._metadata = metadata
             self._is_playing = True
             self._playback_session_id = str(uuid.uuid4())
+            self._playback_auth_generation = auth_generation
             self._stop_emitted = False
             self._last_position = 0.0
             self._last_duration = 0.0
@@ -575,6 +614,7 @@ class PunchPlayPlayer(xbmc.Player):
         metadata: dict[str, Any],
         settings: dict[str, Any],
         session_id: str | None,
+        auth_generation: int,
         watched: bool,
     ) -> None:
         """
@@ -586,6 +626,16 @@ class PunchPlayPlayer(xbmc.Player):
             self._cache.delete_pending_scrobbles_for_session(session_id)
 
         stop_resp = self._api.post(SCROBBLE_STOP_ENDPOINT, payload)
+
+        # logout() invalidates all work from the previous account. The HTTP
+        # request may already have completed, but its response must not create
+        # a rating prompt that could later submit under a different login.
+        if auth_generation != self._api.auth_generation:
+            xbmc.log(
+                "[PunchPlay] Discarding stop response after logout",
+                xbmc.LOGDEBUG,
+            )
+            return
 
         if not watched:
             return
@@ -603,7 +653,9 @@ class PunchPlayPlayer(xbmc.Player):
 
     def _emit_stop(self, settings: dict[str, Any]) -> None:
         """Post a stop event for the current item (without clearing state)."""
-        if self._metadata is None:
+        metadata = self._metadata
+        auth_generation = self._playback_auth_generation
+        if metadata is None or auth_generation is None:
             return
         try:
             captured = self._capture_position()
@@ -615,7 +667,7 @@ class PunchPlayPlayer(xbmc.Player):
                 position, duration = captured
             if duration > 0 and position + STOP_COMPLETE_GRACE_SECS >= duration:
                 position = duration
-            payload = self._build_payload(self._metadata, position, duration)
+            payload = self._build_payload(metadata, position, duration)
             payload["watched_threshold"] = settings["watched_threshold"]
             watched = duration > 0 and payload["progress"] >= settings["watched_threshold"]
             payload["watched"] = watched
@@ -626,7 +678,7 @@ class PunchPlayPlayer(xbmc.Player):
                     xbmc.LOGINFO,
                 )
             xbmc.log(
-                f"[PunchPlay] Stop: {self._metadata.get('title')!r} "
+                f"[PunchPlay] Stop: {metadata.get('title')!r} "
                 f"pos={payload['position_seconds']}s",
                 xbmc.LOGINFO,
             )
@@ -634,11 +686,11 @@ class PunchPlayPlayer(xbmc.Player):
             # background threads, and this is cheap.
             if watched:
                 _s = localize
-                title = self._metadata.get("title", "")
-                media_type = self._metadata.get("media_type", "movie")
+                title = metadata.get("title", "")
+                media_type = metadata.get("media_type", "movie")
                 if media_type == "episode":
-                    season = self._metadata.get("season")
-                    episode = self._metadata.get("episode")
+                    season = metadata.get("season")
+                    episode = metadata.get("episode")
                     if isinstance(season, int) and isinstance(episode, int):
                         msg = _s(32014).format(title, f"{season:02d}", f"{episode:02d}")
                     else:
@@ -649,17 +701,19 @@ class PunchPlayPlayer(xbmc.Player):
 
             # Snapshot everything the worker needs — _handle_stop clears this
             # instance state as soon as we return.
-            metadata = dict(self._metadata)
+            metadata = dict(metadata)
             session_id = self._playback_session_id
             self._dispatch(
                 _PostJob(
                     SCROBBLE_STOP_ENDPOINT,
                     payload,
+                    auth_generation,
                     lambda: self._send_stop(
                         payload=payload,
                         metadata=metadata,
                         settings=settings,
                         session_id=session_id,
+                        auth_generation=auth_generation,
                         watched=watched,
                     ),
                 )
@@ -844,7 +898,41 @@ class PunchPlayPlayer(xbmc.Player):
         finally:
             self._metadata = None
             self._playback_session_id = None
+            self._playback_auth_generation = None
             self._stop_emitted = False
+
+    def handle_logout(self) -> None:
+        """Cancel playback work belonging to the account just logged out.
+
+        The API generation has already advanced when this is called. Queued
+        jobs from the old generation are discarded, while an in-flight job is
+        prevented by APIClient.post() from repopulating the cleared SQLite
+        queue if its request later fails.
+        """
+        self._is_playing = False
+        self._stop_heartbeat()
+        self._metadata = None
+        self._playback_session_id = None
+        self._playback_auth_generation = None
+        self._stop_emitted = False
+        with self._rating_lock:
+            self._pending_rating = None
+
+        discarded = 0
+        with self._post_state_lock:
+            while True:
+                try:
+                    job = self._post_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if job is not None:
+                    discarded += 1
+                self._post_queue.task_done()
+        if discarded:
+            xbmc.log(
+                f"[PunchPlay] Discarded {discarded} queued post(s) on logout",
+                xbmc.LOGINFO,
+            )
 
     # ------------------------------------------------------------------
     # Cleanup (called on service shutdown)
@@ -855,6 +943,7 @@ class PunchPlayPlayer(xbmc.Player):
         self._stop_heartbeat()
         self._metadata = None
         self._playback_session_id = None
+        self._playback_auth_generation = None
         self._stop_emitted = False
         with self._rating_lock:
             self._pending_rating = None
@@ -919,10 +1008,13 @@ class PunchPlayPlayer(xbmc.Player):
                 job = self._post_queue.get_nowait()
             except queue.Empty:
                 break
-            if job is not None:
+            if job is not None and job.auth_generation == self._api.auth_generation:
                 jobs.append(job)
             self._post_queue.task_done()
-        if active_job is not None:
+        if (
+            active_job is not None
+            and active_job.auth_generation == self._api.auth_generation
+        ):
             jobs.append(active_job)
         if jobs:
             self._cache.enqueue_scrobbles([(job.endpoint, job.payload) for job in jobs])

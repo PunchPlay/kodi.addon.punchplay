@@ -134,7 +134,8 @@ class PunchPlayService(xbmc.Monitor):
                     )
                 else:
                     xbmc.log("[PunchPlay] Logout triggered from settings", xbmc.LOGINFO)
-                    self._api.logout()
+                    if self._api.logout():
+                        self._player.handle_logout()
 
             if home_window.getProperty(ACTION_PROPERTY_TEST_CONNECTION):
                 home_window.clearProperty(ACTION_PROPERTY_TEST_CONNECTION)
@@ -378,7 +379,7 @@ class PunchPlayService(xbmc.Monitor):
         if not events:
             return
 
-        from library_events import build_import_entry
+        from library_events import LibraryDetailLookupError, build_import_entry
 
         addon = get_addon()
         scrobble_settings = {
@@ -388,8 +389,13 @@ class PunchPlayService(xbmc.Monitor):
         }
 
         entries = []
+        retry_events = []
         for event in events:
-            entry = build_import_entry(event)
+            try:
+                entry = build_import_entry(event)
+            except LibraryDetailLookupError:
+                retry_events.append(event)
+                continue
             if entry is None or not entry.get("title"):
                 continue
             content_key = "anime" if entry.get("anime") else entry["media_type"]
@@ -400,6 +406,14 @@ class PunchPlayService(xbmc.Monitor):
                 )
                 continue
             entries.append(entry)
+
+        if retry_events:
+            self._live_sync.requeue_events(retry_events)
+            xbmc.log(
+                f"[PunchPlay] Requeued {len(retry_events)} watched toggle(s) "
+                "after detail lookup failure",
+                xbmc.LOGWARNING,
+            )
 
         if not entries:
             return
@@ -449,6 +463,13 @@ class PunchPlayService(xbmc.Monitor):
             "auto": addon.getSettingBool("pull_sync_auto"),
         }
 
+    def _pull_sync_context(self, settings: dict[str, bool]) -> str:
+        """Stable key for the enabled halves of automatic pull sync."""
+        return "watched={0};resume={1}".format(
+            int(settings["watched"]),
+            int(settings["resume"]),
+        )
+
     def _maybe_auto_pull_sync(self) -> None:
         settings = self._pull_sync_settings()
         if not settings["auto"]:
@@ -457,6 +478,7 @@ class PunchPlayService(xbmc.Monitor):
             return
         if not self._api.is_authenticated():
             return
+        self._cache.ensure_pull_sync_context(self._pull_sync_context(settings))
         last_ms = self._cache.get_runtime_status().get("last_pull_sync_at") or 0
         now_ms = int(time.time() * 1000)
         if now_ms - int(last_ms) < PULL_SYNC_INTERVAL_SECS * 1000:
@@ -484,6 +506,7 @@ class PunchPlayService(xbmc.Monitor):
                     NOTIFICATION_TITLE, _s(32132), xbmcgui.NOTIFICATION_WARNING, 4000
                 )
             return
+        self._cache.ensure_pull_sync_context(self._pull_sync_context(settings))
 
         from pull_sync import run_pull_sync
 
@@ -503,7 +526,6 @@ class PunchPlayService(xbmc.Monitor):
             )
             return True
 
-        applied: set = set()
         failed_items: set[str] = set()
         try:
             summary = run_pull_sync(
@@ -512,7 +534,7 @@ class PunchPlayService(xbmc.Monitor):
                 apply_resume=settings["resume"],
                 since_ms=since_ms,
                 progress_callback=_progress_callback,
-                applied_out=applied,
+                applied_callback=lambda item: self._live_sync.record_pull_applied({item}),
                 failed_out=failed_items,
             )
         except Exception as exc:
@@ -529,16 +551,13 @@ class PunchPlayService(xbmc.Monitor):
         if progress is not None:
             progress.close()
 
-        # Everything we just wrote will echo back as VideoLibrary.OnUpdate —
-        # tell live watched sync those are not manual toggles.
-        if applied:
-            self._live_sync.record_pull_applied(applied)
-
         marked = summary["movies_marked"] + summary["episodes_marked"]
         apply_failed = summary.get("apply_failed") or 0
-        summary_text = (
-            f"{marked} watched, {summary['resume_set']} resume, "
-            f"{summary['unmatched']} unmatched, {apply_failed} failed"
+        summary_text = _s(32138).format(
+            marked,
+            summary["resume_set"],
+            summary["unmatched"],
+            apply_failed,
         )
 
         if summary.get("cancelled"):

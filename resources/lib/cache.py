@@ -80,7 +80,8 @@ class Cache:
                     last_pull_sync_at          INTEGER,
                     last_pull_sync_summary     TEXT,
                     pull_sync_held_runs        INTEGER,
-                    pull_sync_failure_counts   TEXT
+                    pull_sync_failure_counts   TEXT,
+                    pull_sync_context          TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS rating_suppressions (
@@ -160,6 +161,7 @@ class Cache:
             ("last_pull_sync_summary", "TEXT"),
             ("pull_sync_held_runs", "INTEGER"),
             ("pull_sync_failure_counts", "TEXT"),
+            ("pull_sync_context", "TEXT"),
         ):
             if column_name not in existing_columns:
                 if not column_name.replace("_", "").isalnum():
@@ -521,10 +523,59 @@ class Cache:
 
     def set_account_username(self, username: str | None) -> None:
         with self._connect() as conn:
+            current = conn.execute(
+                "SELECT account_username FROM runtime_status WHERE singleton = 1"
+            ).fetchone()
+            account_changed = (
+                username is None
+                or current is None
+                or current[0] != username
+            )
+            if account_changed:
+                conn.execute(
+                    """
+                    UPDATE runtime_status
+                    SET account_username = ?,
+                        last_pull_sync_at = NULL,
+                        last_pull_sync_summary = NULL,
+                        pull_sync_held_runs = 0,
+                        pull_sync_failure_counts = NULL,
+                        pull_sync_context = NULL
+                    WHERE singleton = 1
+                    """,
+                    (username,),
+                )
+                return
             conn.execute(
                 "UPDATE runtime_status SET account_username = ? WHERE singleton = 1",
                 (username,),
             )
+
+    def ensure_pull_sync_context(self, context: str) -> bool:
+        """Reset incremental state when the enabled sync halves change.
+
+        Returns True when *context* already matched, False when a full sync is
+        now required.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT pull_sync_context FROM runtime_status WHERE singleton = 1"
+            ).fetchone()
+            if row and row[0] == context:
+                return True
+            conn.execute(
+                """
+                UPDATE runtime_status
+                SET pull_sync_context = ?,
+                    last_pull_sync_at = NULL,
+                    last_pull_sync_summary = NULL,
+                    pull_sync_held_runs = 0,
+                    pull_sync_failure_counts = NULL
+                WHERE singleton = 1
+                """,
+                (context,),
+            )
+        return False
 
     def record_success(self, endpoint: str, title: str = "") -> None:
         with self._connect() as conn:

@@ -22,7 +22,7 @@
     <forum/>
     <website>https://punchplay.tv</website>
     <source>https://github.com/PunchPlay/kodi.addon.punchplay</source>
-    <news>1.5.2 - Fixed concurrent token-refresh 401 errors and watched toggles being suppressed after playback or resume syncs. Pull sync now reports and retries Kodi library write failures without one bad item blocking newer changes. Shutdown preserves queued and in-flight playback events for ordered offline replay.</news>
+    <news>1.5.2 - Fixed concurrent token-refresh 401 errors, old-account work surviving logout, and watched toggles being lost or over-suppressed. Pull-sync checkpoints now follow the active account and enabled sync options. Shutdown preserves queued and in-flight playback events for ordered offline replay.</news>
     <assets>
       <icon>icon.png</icon>
       <fanart>fanart.jpg</fanart>

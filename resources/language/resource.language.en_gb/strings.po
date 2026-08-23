@@ -553,3 +553,7 @@ msgstr ""
 msgctxt "#32137"
 msgid "PunchPlay sync: {0} applied, {1} failed — will retry"
 msgstr ""
+
+msgctxt "#32138"
+msgid "{0} watched, {1} resume, {2} unmatched, {3} failed"
+msgstr ""

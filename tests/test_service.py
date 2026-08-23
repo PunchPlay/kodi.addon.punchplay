@@ -264,6 +264,43 @@ class PostLibraryBatchesTests(unittest.TestCase):
         self.assertEqual([item["title"] for item in diagnostics], ["A", "B"])
 
 
+class LiveWatchedRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.library_events = importlib.import_module("library_events")
+        self.original_build_import_entry = self.library_events.build_import_entry
+        self.original_get_addon = service.get_addon
+        service.get_addon = lambda: types.SimpleNamespace(
+            getSettingBool=lambda key: True
+        )
+
+    def tearDown(self) -> None:
+        self.library_events.build_import_entry = self.original_build_import_entry
+        service.get_addon = self.original_get_addon
+
+    def test_transient_detail_failure_requeues_original_toggle(self) -> None:
+        event = {"item_type": "movie", "library_id": 42, "playcount": 1}
+        requeued: list[dict[str, object]] = []
+
+        self.library_events.build_import_entry = lambda item: (_ for _ in ()).throw(
+            self.library_events.LibraryDetailLookupError("temporary failure")
+        )
+        svc = service.PunchPlayService.__new__(service.PunchPlayService)
+        svc._api = types.SimpleNamespace(
+            is_authenticated=lambda: True,
+            post=lambda *args, **kwargs: self.fail("post should not run"),
+        )
+        svc._player = types.SimpleNamespace(recent_library_items=lambda: [])
+        svc._live_sync = types.SimpleNamespace(
+            pending_count=lambda: 1,
+            pop_due_events=lambda recent: [event],
+            requeue_events=lambda events: requeued.extend(events),
+        )
+
+        svc._push_watched_toggles()
+
+        self.assertEqual(requeued, [event])
+
+
 class _PullSyncApi:
     def is_authenticated(self) -> bool:
         return True

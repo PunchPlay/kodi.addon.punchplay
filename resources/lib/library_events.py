@@ -25,11 +25,17 @@ import xbmc
 
 from constants import (
     LIVE_SYNC_DEBOUNCE_SECS,
+    LIVE_SYNC_DETAIL_RETRY_SECS,
+    LIVE_SYNC_ECHO_MATCH_SECS,
     LIVE_SYNC_MAX_BATCH,
     LIVE_SYNC_ECHO_SUPPRESS_SECS,
     kodi_datetime_to_utc_iso,
 )
 from pull_sync import _rpc
+
+
+class LibraryDetailLookupError(RuntimeError):
+    """Transient Kodi JSON-RPC failure while resolving a watched event."""
 
 
 def parse_video_library_update(data: str | None) -> dict[str, Any] | None:
@@ -113,6 +119,31 @@ class LiveWatchedSync:
         with self._lock:
             return len(self._events)
 
+    def requeue_events(self, events: list[dict[str, Any]]) -> None:
+        """Retry detail lookups after a bounded delay.
+
+        A newer OnUpdate for the same item wins; requeueing an older event
+        must never overwrite it. Missing/deleted library items are not passed
+        here—only transient JSON-RPC failures are retryable.
+        """
+        if not events:
+            return
+        now = time.monotonic()
+        with self._lock:
+            existing = {
+                (event["item_type"], event["library_id"])
+                for event in self._events
+            }
+            for event in events:
+                key = (event["item_type"], event["library_id"])
+                if key in existing:
+                    continue
+                retry = dict(event)
+                retry["at"] = now
+                retry["not_before"] = now + LIVE_SYNC_DETAIL_RETRY_SECS
+                self._events.append(retry)
+                existing.add(key)
+
     def pop_due_events(
         self,
         recent_library_items: list[tuple[str, int, float]] | None = None,
@@ -133,6 +164,7 @@ class LiveWatchedSync:
                 event
                 for event in self._events
                 if current - event["at"] >= LIVE_SYNC_DEBOUNCE_SECS
+                and current >= event.get("not_before", 0)
             ]
             if not due:
                 return []
@@ -157,15 +189,21 @@ class LiveWatchedSync:
         result: list[dict[str, Any]] = []
         for event in due:
             key = (event["item_type"], event["library_id"])
-            if key in pull_applied:
+            pull_applied_at = pull_applied.get(key)
+            if (
+                pull_applied_at is not None
+                and abs(event["at"] - pull_applied_at) <= LIVE_SYNC_ECHO_MATCH_SECS
+            ):
                 xbmc.log(
                     f"[PunchPlay] Watched toggle {key} suppressed (pull sync echo)",
                     xbmc.LOGDEBUG,
                 )
                 continue
             if any(
-                item_type == event["item_type"] and library_id == event["library_id"]
-                for item_type, library_id, _ in recent
+                item_type == event["item_type"]
+                and library_id == event["library_id"]
+                and abs(event["at"] - played_at) <= LIVE_SYNC_ECHO_MATCH_SECS
+                for item_type, library_id, played_at in recent
             ):
                 xbmc.log(
                     f"[PunchPlay] Watched toggle {key} suppressed (recently played)",
@@ -268,4 +306,4 @@ def build_import_entry(event: dict[str, Any]) -> dict[str, Any] | None:
         return build_episode_import_entry(event["library_id"], event["playcount"])
     except (RuntimeError, KeyError, TypeError, ValueError) as exc:
         xbmc.log(f"[PunchPlay] Watched toggle detail fetch failed: {exc}", xbmc.LOGWARNING)
-        return None
+        raise LibraryDetailLookupError(str(exc)) from exc

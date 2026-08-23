@@ -77,6 +77,12 @@ PULL_SYNC_MAX_HELD_RUNS = 3
 # Live watched-state sync (VideoLibrary.OnUpdate → PunchPlay import).
 LIVE_SYNC_DEBOUNCE_SECS = 2.0
 LIVE_SYNC_MAX_BATCH = 100
+LIVE_SYNC_DETAIL_RETRY_SECS = 30.0
+# An OnUpdate caused by one of our own writes should arrive almost
+# immediately. Keep bookkeeping for longer so delayed announcements can still
+# be compared, but only suppress events whose timestamps actually match the
+# write; otherwise a later manual "mark watched" would be swallowed.
+LIVE_SYNC_ECHO_MATCH_SECS = 5.0
 # Used both for the "just played this" echo guard (player.py) and the "we
 # just pull-synced this" echo guard (library_events.py) — one constant,
 # since both only need to bridge the same kind of gap: our own write

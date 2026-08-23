@@ -92,6 +92,7 @@ class _FakeAddon:
 
 class _FakeAPI:
     device_id = "device-1234"
+    auth_generation = 0
 
     def post(self, *args, **kwargs):
         _ = args, kwargs
@@ -145,14 +146,27 @@ class PlayerHelperTests(unittest.TestCase):
             {
                 "media_type": "episode",
                 "title": "Breaking Bad",
+                "year": 2008,
                 "season": 1,
                 "episode": 2,
                 "tmdb_id": 1396,
             }
         )
+        next_episode_keys = player_module.build_rating_suppression_keys(
+            {
+                "media_type": "episode",
+                "title": "Breaking Bad",
+                "year": 2008,
+                "season": 1,
+                "episode": 3,
+                "tmdb_id": 9999,
+            }
+        )
         self.assertIn("title", keys)
         self.assertIn("show", keys)
         self.assertIn("1396", keys["title"])
+        self.assertNotEqual(keys["title"], next_episode_keys["title"])
+        self.assertEqual(keys["show"], next_episode_keys["show"])
 
     def test_payload_includes_event_identity_fields(self) -> None:
         player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=_FakeCache())
@@ -298,6 +312,7 @@ class PostWorkerTests(unittest.TestCase):
 
     def _player(self, api):
         player = player_module.PunchPlayPlayer(api=api, cache=_FakeCache())
+        player._playback_auth_generation = api.auth_generation  # pylint: disable=protected-access
         self.players.append(player)
         return player
 
@@ -369,6 +384,7 @@ class PostWorkerTests(unittest.TestCase):
             metadata={"media_type": "movie", "title": "Inception"},
             settings=_settings(),
             session_id="session-1",
+            auth_generation=api.auth_generation,
             watched=True,
         )
 
@@ -386,6 +402,7 @@ class PostWorkerTests(unittest.TestCase):
             metadata={"media_type": "movie", "title": "Inception", "tmdb_id": 1},
             settings=_settings(),
             session_id=None,
+            auth_generation=api.auth_generation,
             watched=False,
         )
 
@@ -408,9 +425,52 @@ class PostWorkerTests(unittest.TestCase):
         self._drain(player)
         self.assertLessEqual(len(api.posts), 2)
 
+    def test_logout_discards_posts_queued_for_the_previous_account(self) -> None:
+        block = threading.Event()
+        api = _RecordingAPI(block=block)
+        player = self._player(api)
+
+        player._playback_auth_generation = 0  # pylint: disable=protected-access
+        player._dispatch_post("/api/scrobble/progress", {"event_id": "active"})
+        self.assertTrue(api.entered.wait(1))
+        player._dispatch_post("/api/scrobble/stop", {"event_id": "queued"})
+
+        api.auth_generation = 1
+        player.handle_logout()
+
+        self.assertEqual(player._post_queue.qsize(), 0)  # pylint: disable=protected-access
+        block.set()
+        self._drain(player)
+        self.assertEqual(
+            [payload["event_id"] for _, payload in api.posts],
+            ["active"],
+        )
+
+    def test_logout_discards_rating_from_an_in_flight_stop(self) -> None:
+        block = threading.Event()
+        api = _RecordingAPI(block=block)
+        api.stop_response = {"tmdb_id": 27205}
+        player = self._player(api)
+        player._metadata = {  # pylint: disable=protected-access
+            "media_type": "movie",
+            "title": "Inception",
+            "tmdb_id": 27205,
+        }
+        player._playback_session_id = "session-1"  # pylint: disable=protected-access
+
+        player._emit_stop(_settings())  # pylint: disable=protected-access
+        self.assertTrue(api.entered.wait(1))
+        api.auth_generation += 1
+        player.handle_logout()
+        block.set()
+        self._drain(player)
+
+        self.assertIsNone(player._pending_rating)  # pylint: disable=protected-access
+
     def test_cleanup_drains_queued_posts(self) -> None:
         api = _RecordingAPI()
         player = player_module.PunchPlayPlayer(api=api, cache=_FakeCache())
+        player._playback_auth_generation = api.auth_generation  # pylint: disable=protected-access
 
         player._dispatch_post("/api/scrobble/stop", {"title": "Inception"})
         player.cleanup()
@@ -424,10 +484,10 @@ class PostWorkerTests(unittest.TestCase):
         cache = _FakeCache()
         player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=cache)
         player._post_queue.put(  # pylint: disable=protected-access
-            player_module._PostJob("/api/scrobble/progress", {"n": 1}, lambda: None)
+            player_module._PostJob("/api/scrobble/progress", {"n": 1}, 0, lambda: None)
         )
         player._post_queue.put(  # pylint: disable=protected-access
-            player_module._PostJob("/api/scrobble/stop", {"n": 2}, lambda: None)
+            player_module._PostJob("/api/scrobble/stop", {"n": 2}, 0, lambda: None)
         )
 
         player._persist_unsent_queue()  # pylint: disable=protected-access
@@ -443,6 +503,7 @@ class PostWorkerTests(unittest.TestCase):
         api = _RecordingAPI(block=block)
         cache = _FakeCache()
         player = player_module.PunchPlayPlayer(api=api, cache=cache)
+        player._playback_auth_generation = api.auth_generation  # pylint: disable=protected-access
         original_timeout = player_module.POST_WORKER_JOIN_TIMEOUT_SECS
         player_module.POST_WORKER_JOIN_TIMEOUT_SECS = 0.01
         worker = None
@@ -466,6 +527,7 @@ class PostWorkerTests(unittest.TestCase):
         api = _RecordingAPI(block=block)
         cache = _FakeCache()
         player = player_module.PunchPlayPlayer(api=api, cache=cache)
+        player._playback_auth_generation = api.auth_generation  # pylint: disable=protected-access
         player._post_queue = queue.Queue(maxsize=1)  # pylint: disable=protected-access
         original_timeout = player_module.POST_WORKER_JOIN_TIMEOUT_SECS
         player_module.POST_WORKER_JOIN_TIMEOUT_SECS = 0.01

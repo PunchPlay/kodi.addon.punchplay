@@ -98,6 +98,7 @@ class CacheTests(unittest.TestCase):
                 row[1] for row in conn.execute("PRAGMA table_info(runtime_status)")
             }
         self.assertIn("pull_sync_failure_counts", runtime_columns)
+        self.assertIn("pull_sync_context", runtime_columns)
 
     def test_queue_prefers_dropping_progress_before_stop(self) -> None:
         cache_module.OFFLINE_QUEUE_MAX_ITEMS = 2
@@ -182,6 +183,31 @@ class CacheTests(unittest.TestCase):
             status["last_pull_sync_summary"], "3 watched, 1 resume, 0 unmatched"
         )
         self.assertIsNotNone(status["last_pull_sync_at"])
+
+    def test_pull_sync_context_change_requires_a_full_sync(self) -> None:
+        cache = cache_module.Cache()
+
+        self.assertFalse(cache.ensure_pull_sync_context("watched=1;resume=0"))
+        cache.record_pull_sync("watched only")
+        checkpoint = cache.get_runtime_status()["last_pull_sync_at"]
+        self.assertTrue(cache.ensure_pull_sync_context("watched=1;resume=0"))
+        self.assertEqual(cache.get_runtime_status()["last_pull_sync_at"], checkpoint)
+
+        self.assertFalse(cache.ensure_pull_sync_context("watched=1;resume=1"))
+        self.assertIsNone(cache.get_runtime_status()["last_pull_sync_at"])
+
+    def test_account_change_clears_pull_sync_checkpoint(self) -> None:
+        cache = cache_module.Cache()
+        cache.set_account_username("alice")
+        cache.ensure_pull_sync_context("watched=1;resume=1")
+        cache.record_pull_sync("alice sync")
+
+        cache.set_account_username("bob")
+
+        status = cache.get_runtime_status()
+        self.assertEqual(status["account_username"], "bob")
+        self.assertIsNone(status["last_pull_sync_at"])
+        self.assertFalse(cache.ensure_pull_sync_context("watched=1;resume=1"))
 
     def test_pending_scrobbles_replay_by_event_time_not_insertion_order(self) -> None:
         # A later event can be persisted before an earlier one that was still

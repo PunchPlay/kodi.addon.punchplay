@@ -255,6 +255,7 @@ def run_pull_sync(
     since_ms: int | None = None,
     progress_callback=None,
     applied_out: set | None = None,
+    applied_callback=None,
     failed_out: set[str] | None = None,
 ) -> dict[str, int]:
     """
@@ -266,6 +267,9 @@ def run_pull_sync(
     When `applied_out` is given, ("movie"|"episode", library_id) tuples are
     added for every watched state we set — live watched sync uses these to
     suppress the resulting OnUpdate echoes.
+    `applied_callback`, when provided, is invoked with each tuple immediately
+    after the write so echo matching uses the write time rather than the end
+    of a potentially long library sync.
     When `failed_out` is given, stable hashed identities are added for every
     library write that failed so checkpoint retry counts can be scoped per
     item without persisting media metadata.
@@ -289,11 +293,14 @@ def run_pull_sync(
         "cancelled": 0,
         "apply_failed": 0,
     }
-    if not movies and not episodes and not in_progress:
+    total = (
+        (len(movies) + len(episodes) if apply_watched else 0)
+        + (len(in_progress) if apply_resume else 0)
+    )
+    if total == 0:
         return summary
 
     index = KodiLibraryIndex()
-    total = len(movies) + len(episodes) + len(in_progress)
     done = 0
 
     def _tick() -> bool:
@@ -318,8 +325,11 @@ def run_pull_sync(
             try:
                 _set_movie_watched(movie, remote_movie)
                 summary["movies_marked"] += 1
+                applied_item = ("movie", int(movie["movieid"]))
                 if applied_out is not None:
-                    applied_out.add(("movie", int(movie["movieid"])))
+                    applied_out.add(applied_item)
+                if applied_callback is not None:
+                    applied_callback(applied_item)
             except (RuntimeError, KeyError, TypeError, ValueError) as exc:
                 summary["apply_failed"] += 1
                 _record_failed_item(failed_out, "movie_watched", remote_movie)
@@ -338,8 +348,11 @@ def run_pull_sync(
             try:
                 _set_episode_watched(episode, remote_episode)
                 summary["episodes_marked"] += 1
+                applied_item = ("episode", int(episode["episodeid"]))
                 if applied_out is not None:
-                    applied_out.add(("episode", int(episode["episodeid"])))
+                    applied_out.add(applied_item)
+                if applied_callback is not None:
+                    applied_callback(applied_item)
             except (RuntimeError, KeyError, TypeError, ValueError) as exc:
                 summary["apply_failed"] += 1
                 _record_failed_item(failed_out, "episode_watched", remote_episode)

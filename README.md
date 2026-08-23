@@ -7,9 +7,10 @@ It supports Kodi Nexus 20 and Omega 21.
 ## What's New In 1.5.2
 
 - Fixed intermittent HTTP 401 errors during PunchPlay to Kodi sync when playback and the service refreshed an expired token at the same time.
-- Fixed live watched toggles being suppressed after resume syncs or for too long after playback.
-- Pull sync now reports and retries Kodi library write failures without allowing one bad item to block the checkpoint forever.
+- Fixed live watched toggles being suppressed after resume syncs, lost on transient Kodi detail failures, or mistaken for playback echoes.
+- Pull sync now reports and retries Kodi library write failures without allowing one bad item to block the checkpoint forever, and resets incremental state when the account or enabled sync halves change.
 - Kodi shutdown now preserves queued and in-flight playback events for correctly ordered offline replay.
+- Logout now discards old-account work still in memory, and device-code pollers no longer race after the QR window is dismissed.
 
 1.5.1 improved large-library imports, moved scrobbles off Kodi's player callback thread, and made device-code login friendlier to shared connections.
 
