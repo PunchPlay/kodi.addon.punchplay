@@ -300,6 +300,60 @@ class LiveWatchedRetryTests(unittest.TestCase):
 
         self.assertEqual(requeued, [event])
 
+    def _push_anime_movie(
+        self,
+        *,
+        movies_enabled: bool,
+        anime_enabled: bool,
+    ) -> list[dict[str, object]]:
+        event = {"item_type": "movie", "library_id": 42, "playcount": 1}
+        self.library_events.build_import_entry = lambda item: {
+            "media_type": "movie",
+            "title": "Spirited Away",
+            "tmdb_id": 129,
+            "anime": True,
+        }
+        settings = {
+            "scrobble_movies": movies_enabled,
+            "scrobble_tv": True,
+            "scrobble_anime": anime_enabled,
+        }
+        service.get_addon = lambda: types.SimpleNamespace(
+            getSettingBool=lambda key: settings[key]
+        )
+        posted: list[dict[str, object]] = []
+        svc = service.PunchPlayService.__new__(service.PunchPlayService)
+        svc._api = types.SimpleNamespace(
+            is_authenticated=lambda: True,
+            post=lambda endpoint, payload: posted.append(payload) or {},
+        )
+        svc._player = types.SimpleNamespace(recent_library_items=lambda: [])
+        svc._live_sync = types.SimpleNamespace(
+            pending_count=lambda: 1,
+            pop_due_events=lambda recent: [event],
+            requeue_events=lambda events: None,
+        )
+
+        svc._push_watched_toggles()
+        return posted
+
+    def test_anime_movie_is_skipped_when_movie_scrobbling_is_disabled(self) -> None:
+        posted = self._push_anime_movie(
+            movies_enabled=False,
+            anime_enabled=True,
+        )
+
+        self.assertEqual(posted, [])
+
+    def test_anime_movie_ignores_disabled_anime_episode_setting(self) -> None:
+        posted = self._push_anime_movie(
+            movies_enabled=True,
+            anime_enabled=False,
+        )
+
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0]["entries"][0]["title"], "Spirited Away")
+
 
 class _PullSyncApi:
     def is_authenticated(self) -> bool:

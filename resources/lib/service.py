@@ -404,7 +404,11 @@ class PunchPlayService(xbmc.Monitor):
                 continue
             if entry is None or not entry.get("title"):
                 continue
-            content_key = "anime" if entry.get("anime") else entry["media_type"]
+            # Anime is a separate toggle only for episodes. Movies always
+            # follow the movie setting, matching PunchPlayPlayer._should_track.
+            content_key = entry["media_type"]
+            if content_key == "episode" and entry.get("anime"):
+                content_key = "anime"
             if not scrobble_settings.get(content_key, True):
                 xbmc.log(
                     f"[PunchPlay] Watched toggle skipped — {content_key} scrobbling disabled",
