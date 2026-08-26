@@ -6,12 +6,19 @@ It supports Kodi Nexus 20 and Omega 21.
 
 ## What's New In 1.5.2
 
+- Fixed the token-refresh request being rejected by the server's network edge (a missing User-Agent header), which broke reconnection for every user once their access token expired and forced repeated manual re-logins.
+- Fixed playback staying "now playing" on the server forever if Kodi was closed while something was still playing.
 - Fixed intermittent HTTP 401 errors during PunchPlay to Kodi sync when playback and the service refreshed an expired token at the same time.
-- Fixed live watched toggles being suppressed after resume syncs, lost on transient Kodi detail failures, or mistaken for playback echoes.
-- Pull sync now reports and retries Kodi library write failures without allowing one bad item to block the checkpoint forever, and resets incremental state when the account or enabled sync halves change.
-- Kodi shutdown now preserves queued and in-flight playback events for correctly ordered offline replay.
+- Fixed live watched toggles being suppressed after resume syncs, lost on transient Kodi detail failures, mistaken for playback echoes, or still uploaded after being un-watched within the same debounce window.
+- Fixed the "never for this show" rating suppression still varying between episodes of the same show; it's now keyed on the show's title rather than per-episode ids or year, both of which change episode to episode.
+- Pull sync now reports and retries Kodi library write failures without allowing one bad item to block the checkpoint forever, resets incremental state when the account or enabled sync halves change, no longer lets a stale remote resume position overwrite a locally completed item, and no longer falls back to a stale checkpoint after a failed full pull.
+- Kodi shutdown now preserves queued and in-flight playback events for correctly ordered offline replay, and a queued offline event can no longer replay after it was already cleaned up by a stop event racing it, or reach the backend after a new playback's start — even under a full post queue, where the drain and the start now dispatch as a single unit instead of two that could be split apart.
+- A playback event can no longer overtake an earlier event from the same session that's still stuck in the offline queue — once one event for a session goes durable, later events for it stay durable too until a complete flush replays the backlog.
+- Live watched-toggle syncs no longer block the background service for up to 15-30s on a slow backend; they route through the same worker as every other network write, which also means offline-queue replay is now pinned to the account it was queued under.
+- A stop event that hits a full post queue still runs its full cleanup and rating prompt instead of only being persisted for retry.
 - Logout now discards old-account work still in memory, and device-code pollers no longer race after the QR window is dismissed.
 - Rating prompts can now be limited to movies while episode scrobbling continues normally.
+- Rating suppressions written under an earlier version's key format are migrated automatically on upgrade.
 
 1.5.1 improved large-library imports, moved scrobbles off Kodi's player callback thread, and made device-code login friendlier to shared connections.
 
@@ -138,6 +145,8 @@ Keeping your Kodi library scraped with TMDB, TVDB, or IMDb-compatible IDs still 
 If PunchPlay cannot be reached, scrobble events are written to a local SQLite queue in Kodi addon data. The queue is replayed in order when the connection returns.
 
 The queue is capped at 500 events, stores retry metadata, and drops entries older than 30 days. When the queue is full, the addon drops older low-value progress events before it drops authoritative stop events.
+
+If the in-memory network worker queue itself fills, authoritative stop events are persisted directly to the offline queue rather than dropped.
 
 Completed playback sessions clear their older queued session events before the final stop is sent, which prevents stale progress from bringing a watched item back into continue-watching.
 

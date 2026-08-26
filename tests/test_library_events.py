@@ -65,11 +65,15 @@ class ParseVideoLibraryUpdateTests(unittest.TestCase):
             )
         )
 
-    def test_ignores_unwatch_toggles(self) -> None:
-        self.assertIsNone(
-            library_events.parse_video_library_update(
-                json.dumps({"id": 5, "type": "movie", "playcount": 0})
-            )
+    def test_parses_unwatch_toggles(self) -> None:
+        # Still parsed (not None) — LiveWatchedSync needs to see it to
+        # cancel a pending watched toggle for the same item, even though
+        # it's never queued for upload itself.
+        event = library_events.parse_video_library_update(
+            json.dumps({"id": 5, "type": "movie", "playcount": 0})
+        )
+        self.assertEqual(
+            event, {"item_type": "movie", "library_id": 5, "playcount": 0}
         )
 
     def test_ignores_scan_updates(self) -> None:
@@ -130,6 +134,27 @@ class LiveWatchedSyncTests(unittest.TestCase):
             [], now=_time.monotonic() + library_events.LIVE_SYNC_DEBOUNCE_SECS + 1
         )
         self.assertEqual(due[0]["playcount"], 3)
+
+    def test_unwatch_within_debounce_window_cancels_pending_watch(self) -> None:
+        # Mark watched, then reverse it before the debounce window pops —
+        # the reversed watch must not still upload once the window elapses.
+        sync = library_events.LiveWatchedSync()
+        self._push(sync, id=1, type="movie", playcount=1)
+        self._push(sync, id=1, type="movie", playcount=0)
+
+        self.assertEqual(sync.pending_count(), 0)
+        import time as _time
+
+        due = sync.pop_due_events(
+            [], now=_time.monotonic() + library_events.LIVE_SYNC_DEBOUNCE_SECS + 1
+        )
+        self.assertEqual(due, [])
+
+    def test_unwatch_with_nothing_pending_is_a_noop(self) -> None:
+        sync = library_events.LiveWatchedSync()
+        self._push(sync, id=1, type="movie", playcount=0)
+
+        self.assertEqual(sync.pending_count(), 0)
 
     def test_pull_applied_items_are_suppressed(self) -> None:
         sync = library_events.LiveWatchedSync()

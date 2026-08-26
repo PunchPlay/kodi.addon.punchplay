@@ -102,8 +102,19 @@ class _FakeAPI:
         _ = args, kwargs
         return {}
 
-    def flush_queue(self) -> None:
-        return None
+    def flush_queue(self, *, expected_auth_generation: int | None = None) -> bool:
+        _ = expected_auth_generation
+        return True
+
+    def preserve_post_for_retry(
+        self,
+        endpoint,
+        payload,
+        *,
+        expected_auth_generation,
+    ) -> bool:
+        _ = endpoint, payload, expected_auth_generation
+        return True
 
     def is_authenticated(self) -> bool:
         return True
@@ -112,6 +123,7 @@ class _FakeAPI:
 class _FakeCache:
     def __init__(self) -> None:
         self.enqueued: list[tuple[str, dict]] = []
+        self.deleted_sessions: list[str] = []
 
     def has_rating_suppression(self, key: str) -> bool:
         _ = key
@@ -121,7 +133,7 @@ class _FakeCache:
         _ = key, scope
 
     def delete_pending_scrobbles_for_session(self, playback_session_id: str) -> None:
-        _ = playback_session_id
+        self.deleted_sessions.append(playback_session_id)
 
     def enqueue_scrobble(self, endpoint: str, payload: dict) -> None:
         self.enqueued.append((endpoint, payload))
@@ -142,6 +154,11 @@ class PlayerHelperTests(unittest.TestCase):
         player_module.get_addon_version = self.original_get_addon_version
 
     def test_rating_suppression_keys_are_stable(self) -> None:
+        # Kodi reports a distinct uniqueid per episode (InfoTagVideo's
+        # getUniqueIDs() is episode-scoped, not show-scoped), so two
+        # episodes of the same show realistically carry different
+        # tmdb_id values. The "show" key must still match across them —
+        # only "title" is allowed to vary per episode.
         keys = player_module.build_rating_suppression_keys(
             {
                 "media_type": "episode",
@@ -149,7 +166,7 @@ class PlayerHelperTests(unittest.TestCase):
                 "year": 2008,
                 "season": 1,
                 "episode": 2,
-                "tmdb_id": 1396,
+                "tmdb_id": 62161,
             }
         )
         next_episode_keys = player_module.build_rating_suppression_keys(
@@ -159,14 +176,68 @@ class PlayerHelperTests(unittest.TestCase):
                 "year": 2008,
                 "season": 1,
                 "episode": 3,
-                "tmdb_id": 9999,
+                "tmdb_id": 62163,
             }
         )
         self.assertIn("title", keys)
         self.assertIn("show", keys)
-        self.assertIn("1396", keys["title"])
+        self.assertIn("62161", keys["title"])
         self.assertNotEqual(keys["title"], next_episode_keys["title"])
         self.assertEqual(keys["show"], next_episode_keys["show"])
+        self.assertNotIn("62161", keys["show"])
+
+    def test_show_suppression_key_survives_a_year_and_id_change_across_seasons(
+        self,
+    ) -> None:
+        # `year` is InfoTagVideo.getYear() scraped per episode, and
+        # tmdb_id/tvdb_id/imdb_id are per-episode too — a show whose
+        # seasons aired in different calendar years, with different
+        # per-episode ids, must not silently stop matching "Never for
+        # this show".
+        season_one_keys = player_module.build_rating_suppression_keys(
+            {
+                "media_type": "episode",
+                "title": "Breaking Bad",
+                "year": 2008,
+                "season": 1,
+                "episode": 2,
+                "tmdb_id": 62161,
+            }
+        )
+        season_five_keys = player_module.build_rating_suppression_keys(
+            {
+                "media_type": "episode",
+                "title": "Breaking Bad",
+                "year": 2013,
+                "season": 5,
+                "episode": 14,
+                "tmdb_id": 62311,
+            }
+        )
+        self.assertEqual(season_one_keys["show"], season_five_keys["show"])
+
+    def test_show_suppression_key_ignores_missing_ids_too(self) -> None:
+        # Without any canonical id at all, the key still has to be built
+        # from something stable — title, never year.
+        season_one_keys = player_module.build_rating_suppression_keys(
+            {
+                "media_type": "episode",
+                "title": "Unidentified Show",
+                "year": 2008,
+                "season": 1,
+                "episode": 1,
+            }
+        )
+        season_two_keys = player_module.build_rating_suppression_keys(
+            {
+                "media_type": "episode",
+                "title": "Unidentified Show",
+                "year": 2009,
+                "season": 2,
+                "episode": 1,
+            }
+        )
+        self.assertEqual(season_one_keys["show"], season_two_keys["show"])
 
     def test_payload_includes_event_identity_fields(self) -> None:
         player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=_FakeCache())
@@ -304,9 +375,12 @@ class _RecordingAPI(_FakeAPI):
 
     def __init__(self, block: threading.Event | None = None) -> None:
         self.posts: list[tuple[str, dict]] = []
+        self.preserved: list[tuple[str, dict]] = []
         self.block = block
         self.entered = threading.Event()
         self.stop_response: dict = {}
+        self.flush_succeeds = True
+        self.flush_error: Exception | None = None
 
     def post(self, endpoint, payload, *, expected_auth_generation=None):
         _ = expected_auth_generation
@@ -315,6 +389,24 @@ class _RecordingAPI(_FakeAPI):
             self.block.wait(5)
         self.posts.append((endpoint, payload))
         return dict(self.stop_response)
+
+    def flush_queue(self, *, expected_auth_generation: int | None = None) -> bool:
+        _ = expected_auth_generation
+        self.posts.append(("__flush__", {}))
+        if self.flush_error is not None:
+            raise self.flush_error
+        return self.flush_succeeds
+
+    def preserve_post_for_retry(
+        self,
+        endpoint,
+        payload,
+        *,
+        expected_auth_generation,
+    ) -> bool:
+        _ = expected_auth_generation
+        self.preserved.append((endpoint, payload))
+        return True
 
 
 def _settings(**overrides):
@@ -389,6 +481,196 @@ class PostWorkerTests(unittest.TestCase):
             ],
         )
 
+    def test_dispatch_import_runs_on_the_worker_not_the_caller(self) -> None:
+        # _push_watched_toggles() used to call api.post() directly on the
+        # service loop's own thread; dispatch_import() routes it through
+        # the same post worker as every other network write instead.
+        block = threading.Event()
+        api = _RecordingAPI(block=block)
+        player = self._player(api)
+        entries = [{"title": "Spirited Away"}]
+
+        started = time.monotonic()
+        player.dispatch_import(entries)
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(api.entered.wait(5))
+        self.assertLess(elapsed, 1.0)
+
+        block.set()
+        self._drain(player)
+        self.assertEqual(api.posts, [(player_module.SCROBBLE_IMPORT_ENDPOINT, {"entries": entries})])
+
+    def test_dispatch_import_preserves_entries_when_queue_is_full(self) -> None:
+        block = threading.Event()
+        api = _RecordingAPI(block=block)
+        preserved: list[tuple[str, dict]] = []
+        api.preserve_post_for_retry = (  # type: ignore[attr-defined]
+            lambda endpoint, payload, expected_auth_generation: (
+                preserved.append((endpoint, payload)) or True
+            )
+        )
+        player = self._player(api)
+        player._post_queue = queue.Queue(maxsize=1)  # pylint: disable=protected-access
+        original_timeout = player_module.POST_QUEUE_PUT_TIMEOUT_SECS
+        player_module.POST_QUEUE_PUT_TIMEOUT_SECS = 0.01
+        try:
+            # Occupies the worker (blocked inside post()); the queue's one
+            # remaining slot is the only space left.
+            player._dispatch_post("/api/scrobble/progress", {"n": 0})
+            self.assertTrue(api.entered.wait(1))
+            player._dispatch_post("/api/scrobble/progress", {"n": 1})
+
+            entries = [{"title": "Spirited Away"}]
+            player.dispatch_import(entries)
+        finally:
+            block.set()
+            self._drain(player)
+            player_module.POST_QUEUE_PUT_TIMEOUT_SECS = original_timeout
+
+        self.assertEqual(
+            preserved,
+            [(player_module.SCROBBLE_IMPORT_ENDPOINT, {"entries": entries})],
+        )
+
+    def test_start_drains_offline_queue_before_dispatching(self) -> None:
+        # _dispatch_start bundles the flush and the start into a single
+        # worker job's run() — a stale event left over from a session that
+        # ended offline is always flushed before the new start reaches the
+        # network, or it could be delivered after the start and clobber the
+        # now-playing state the start just set.
+        api = _RecordingAPI()
+        player = self._player(api)
+
+        player._dispatch_start({"title": "Inception"})
+        self._drain(player)
+
+        self.assertEqual(
+            [endpoint for endpoint, _ in api.posts],
+            ["__flush__", player_module.SCROBBLE_START_ENDPOINT],
+        )
+
+    def test_start_waits_when_offline_queue_drain_is_incomplete(self) -> None:
+        api = _RecordingAPI()
+        api.flush_succeeds = False
+        player = self._player(api)
+        payload = {
+            "title": "Inception",
+            "playback_session_id": "session-1",
+            "event_created_at": 2000,
+        }
+
+        player._dispatch_start(payload)
+        self._drain(player)
+
+        self.assertEqual(api.posts, [("__flush__", {})])
+        self.assertEqual(
+            api.preserved,
+            [(player_module.SCROBBLE_START_ENDPOINT, payload)],
+        )
+
+    def test_start_is_preserved_when_offline_queue_drain_raises(self) -> None:
+        api = _RecordingAPI()
+        api.flush_error = RuntimeError("sqlite unavailable")
+        player = self._player(api)
+        payload = {
+            "playback_session_id": "session-1",
+            "event_created_at": 2000,
+        }
+
+        player._dispatch_start(payload)
+        self._drain(player)
+
+        self.assertEqual(api.posts, [("__flush__", {})])
+        self.assertEqual(
+            api.preserved,
+            [(player_module.SCROBBLE_START_ENDPOINT, payload)],
+        )
+
+    def test_later_session_events_stay_queued_behind_a_deferred_start(self) -> None:
+        api = _RecordingAPI()
+        api.flush_succeeds = False
+        player = self._player(api)
+        start = {
+            "playback_session_id": "session-1",
+            "event_created_at": 2000,
+        }
+        progress = {
+            "playback_session_id": "session-1",
+            "event_created_at": 3000,
+        }
+
+        player._dispatch_start(start)
+        player._dispatch_post(player_module.SCROBBLE_PROGRESS_ENDPOINT, progress)
+        self._drain(player)
+
+        self.assertEqual(api.posts, [("__flush__", {})])
+        self.assertEqual(
+            api.preserved,
+            [
+                (player_module.SCROBBLE_START_ENDPOINT, start),
+                (player_module.SCROBBLE_PROGRESS_ENDPOINT, progress),
+            ],
+        )
+
+    def test_start_flush_and_post_cannot_be_split_by_a_full_queue(self) -> None:
+        # Two separate dispatch calls could be split by a full queue: the
+        # flush drops (only STOP jobs get preserved-for-retry) while a slot
+        # frees up in time for the start to still get through — recreating
+        # the exact race dispatch_flush() exists to prevent, under the load
+        # conditions where it matters most. Bundling them into one _PostJob
+        # means a full queue can only reject the pair together.
+        block = threading.Event()
+        api = _RecordingAPI(block=block)
+        player = self._player(api)
+        player._post_queue = queue.Queue(maxsize=1)  # pylint: disable=protected-access
+        original_timeout = player_module.POST_QUEUE_PUT_TIMEOUT_SECS
+        player_module.POST_QUEUE_PUT_TIMEOUT_SECS = 0.01
+        try:
+            # Occupies the worker (blocked inside post()); the queue's one
+            # remaining slot is the only space left.
+            player._dispatch_post("/api/scrobble/progress", {"n": 0})
+            self.assertTrue(api.entered.wait(1))
+            player._dispatch_post("/api/scrobble/progress", {"n": 1})
+
+            # No room left for the combined job — it must be preserved whole.
+            payload = {
+                "title": "Inception",
+                "playback_session_id": "session-1",
+            }
+            player._dispatch_start(payload)
+        finally:
+            block.set()
+            self._drain(player)
+            player_module.POST_QUEUE_PUT_TIMEOUT_SECS = original_timeout
+
+        endpoints = [endpoint for endpoint, _ in api.posts]
+        self.assertNotIn(player_module.SCROBBLE_START_ENDPOINT, endpoints)
+        self.assertNotIn("__flush__", endpoints)
+        self.assertEqual(
+            api.preserved,
+            [(player_module.SCROBBLE_START_ENDPOINT, payload)],
+        )
+
+    def test_concurrent_flushes_never_run_at_the_same_time(self) -> None:
+        # The service loop's periodic timer and a pre-start drain both call
+        # dispatch_flush() now — never APIClient.flush_queue() directly on
+        # their own thread — specifically so two flush attempts can't race
+        # each other's check/request/delete sequence. Both funnelling
+        # through the same worker means they simply queue up.
+        api = _RecordingAPI()
+        player = self._player(api)
+
+        player.dispatch_flush()
+        player.dispatch_flush()
+        player._dispatch_post(player_module.SCROBBLE_START_ENDPOINT, {"title": "Inception"})
+        self._drain(player)
+
+        self.assertEqual(
+            [endpoint for endpoint, _ in api.posts],
+            ["__flush__", "__flush__", player_module.SCROBBLE_START_ENDPOINT],
+        )
+
     def test_emit_stop_returns_before_the_network_call_finishes(self) -> None:
         block = threading.Event()
         api = _RecordingAPI(block=block)
@@ -458,6 +740,51 @@ class PostWorkerTests(unittest.TestCase):
         self._drain(player)
         self.assertLessEqual(len(api.posts), 2)
 
+    def test_full_queue_persists_authoritative_stop(self) -> None:
+        # Goes through the real production path (_emit_stop, not the
+        # generic _dispatch_post) so this also proves the offline_fallback
+        # still runs _send_stop's session cleanup, not just the persist —
+        # a queue-full STOP used to bypass _send_stop entirely and skip it.
+        block = threading.Event()
+        api = _RecordingAPI(block=block)
+        cache = _FakeCache()
+        api.preserve_post_for_retry = (  # type: ignore[attr-defined]
+            lambda endpoint, payload, expected_auth_generation: (
+                cache.enqueue_scrobble(endpoint, payload) or True
+            )
+        )
+        player = player_module.PunchPlayPlayer(api=api, cache=cache)
+        player._playback_auth_generation = api.auth_generation  # pylint: disable=protected-access
+        player._metadata = {"media_type": "movie", "title": "Inception"}  # pylint: disable=protected-access
+        player._playback_session_id = "session-1"  # pylint: disable=protected-access
+        player._post_queue = queue.Queue(maxsize=1)  # pylint: disable=protected-access
+        self.players.append(player)
+        original_timeout = player_module.POST_QUEUE_PUT_TIMEOUT_SECS
+        player_module.POST_QUEUE_PUT_TIMEOUT_SECS = 0.01
+        try:
+            player._dispatch_post(
+                "/api/scrobble/progress",
+                {"event_id": "active", "event_created_at": 1000},
+            )
+            self.assertTrue(api.entered.wait(1))
+            player._dispatch_post(
+                "/api/scrobble/progress",
+                {"event_id": "queued", "event_created_at": 2000},
+            )
+
+            # _handle_stop (not _emit_stop directly) so _stop_emitted/
+            # _metadata are cleared properly — otherwise tearDown's cleanup()
+            # sees _metadata still set and fires a second, real stop dispatch.
+            player._handle_stop()
+
+            self.assertEqual(len(cache.enqueued), 1)
+            self.assertEqual(cache.enqueued[0][0], player_module.SCROBBLE_STOP_ENDPOINT)
+            self.assertEqual(cache.deleted_sessions, ["session-1"])
+        finally:
+            block.set()
+            self._drain(player)
+            player_module.POST_QUEUE_PUT_TIMEOUT_SECS = original_timeout
+
     def test_logout_discards_posts_queued_for_the_previous_account(self) -> None:
         block = threading.Event()
         api = _RecordingAPI(block=block)
@@ -511,6 +838,25 @@ class PostWorkerTests(unittest.TestCase):
         # cleanup() joins the worker, so the stop event is already sent.
         self.assertEqual(len(api.posts), 1)
 
+    def test_cleanup_emits_stop_for_playback_still_active_at_shutdown(self) -> None:
+        # Kodi quitting mid-playback never fires onPlayBackStopped or
+        # onPlayBackEnded — those only cover playback ending while Kodi keeps
+        # running. cleanup() is the only signal a whole-app quit gives, so it
+        # must go through _handle_stop and actually emit the stop event, not
+        # just clear local state — otherwise the item is left "now playing"
+        # on the backend forever.
+        api = _RecordingAPI()
+        player = player_module.PunchPlayPlayer(api=api, cache=_FakeCache())
+        player._playback_auth_generation = api.auth_generation  # pylint: disable=protected-access
+        player._metadata = {"media_type": "movie", "title": "Inception"}  # pylint: disable=protected-access
+        player._playback_session_id = "session-1"  # pylint: disable=protected-access
+
+        player.cleanup()
+
+        self.assertEqual(len(api.posts), 1)
+        self.assertEqual(api.posts[0][0], player_module.SCROBBLE_STOP_ENDPOINT)
+        self.assertIsNone(player._metadata)  # pylint: disable=protected-access
+
     def test_persist_unsent_queue_drains_to_offline_cache(self) -> None:
         # Jobs still sitting in the queue when shutdown gives up on the
         # worker must not just vanish with the abandoned daemon thread.
@@ -530,6 +876,25 @@ class PostWorkerTests(unittest.TestCase):
             [("/api/scrobble/progress", {"n": 1}), ("/api/scrobble/stop", {"n": 2})],
         )
         self.assertEqual(player._post_queue.qsize(), 0)  # pylint: disable=protected-access
+
+    def test_persist_unsent_queue_skips_the_flush_sentinel(self) -> None:
+        # A queue-drain job (see dispatch_flush) has no real endpoint or
+        # payload to replay — persisting it verbatim would create a bogus
+        # pending_scrobbles row that later gets POSTed to a fake path.
+        cache = _FakeCache()
+        player = player_module.PunchPlayPlayer(api=_FakeAPI(), cache=cache)
+        player._post_queue.put(  # pylint: disable=protected-access
+            player_module._PostJob(
+                player_module._FLUSH_QUEUE_SENTINEL, {}, 0, lambda: None
+            )
+        )
+        player._post_queue.put(  # pylint: disable=protected-access
+            player_module._PostJob("/api/scrobble/stop", {"n": 1}, 0, lambda: None)
+        )
+
+        player._persist_unsent_queue()  # pylint: disable=protected-access
+
+        self.assertEqual(cache.enqueued, [("/api/scrobble/stop", {"n": 1})])
 
     def test_cleanup_persists_the_in_flight_job_after_timeout(self) -> None:
         block = threading.Event()

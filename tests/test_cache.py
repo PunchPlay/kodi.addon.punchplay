@@ -21,6 +21,7 @@ if "xbmc" not in sys.modules:
     sys.modules["xbmc"] = types.SimpleNamespace(
         LOGDEBUG=0,
         LOGINFO=1,
+        LOGWARNING=2,
         log=lambda *args, **kwargs: None,
     )
 
@@ -100,6 +101,60 @@ class CacheTests(unittest.TestCase):
         self.assertIn("pull_sync_failure_counts", runtime_columns)
         self.assertIn("pull_sync_context", runtime_columns)
 
+    def test_rating_suppression_migration_clears_old_show_key_format(self) -> None:
+        db_path = os.path.join(self.temp_dir, "punchplay.db")
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE rating_suppressions (
+                    key TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+            # Old format: show:{id-or-title}:{title}:{year} — three colons.
+            conn.execute(
+                "INSERT INTO rating_suppressions (key, scope, created_at) "
+                "VALUES ('show:1396:breaking bad:2008', 'show', 1000)"
+            )
+            # New format and an unrelated title key both survive.
+            conn.execute(
+                "INSERT INTO rating_suppressions (key, scope, created_at) "
+                "VALUES ('show:the office', 'show', 1000)"
+            )
+            conn.execute(
+                "INSERT INTO rating_suppressions (key, scope, created_at) "
+                "VALUES ('title:movie:27205:2010::', 'title', 1000)"
+            )
+
+        cache_module.Cache()
+        with sqlite3.connect(db_path) as conn:
+            keys = {row[0] for row in conn.execute("SELECT key FROM rating_suppressions")}
+
+        self.assertNotIn("show:1396:breaking bad:2008", keys)
+        self.assertIn("show:the office", keys)
+        self.assertIn("title:movie:27205:2010::", keys)
+
+    def test_rating_suppression_migration_runs_only_once(self) -> None:
+        db_path = os.path.join(self.temp_dir, "punchplay.db")
+        cache_module.Cache()  # creates the table, runs the migration once
+
+        with sqlite3.connect(db_path) as conn:
+            # A real show:{title} key whose title itself contains two colons
+            # would otherwise match the old 3-segment pattern forever if the
+            # migration weren't gated to run exactly once.
+            conn.execute(
+                "INSERT INTO rating_suppressions (key, scope, created_at) "
+                "VALUES (\"show:grey's anatomy: station 19: crossover\", 'show', 2000)"
+            )
+
+        cache_module.Cache()  # must be a no-op for this migration this time
+        with sqlite3.connect(db_path) as conn:
+            keys = {row[0] for row in conn.execute("SELECT key FROM rating_suppressions")}
+
+        self.assertIn("show:grey's anatomy: station 19: crossover", keys)
+
     def test_queue_prefers_dropping_progress_before_stop(self) -> None:
         cache_module.OFFLINE_QUEUE_MAX_ITEMS = 2
         cache = cache_module.Cache()
@@ -122,6 +177,24 @@ class CacheTests(unittest.TestCase):
         self.assertIn("stop", event_ids)
         self.assertIn("progress-2", event_ids)
         self.assertNotIn("progress-1", event_ids)
+
+    def test_pending_scrobble_exists_reflects_deletion(self) -> None:
+        # flush_queue() snapshots pending rows, then re-checks each one just
+        # before replaying it, so a row deleted by session-ending cleanup
+        # (delete_pending_scrobbles_for_session) after the snapshot was
+        # taken isn't replayed as a stale event after an authoritative stop.
+        cache = cache_module.Cache()
+        cache.enqueue_scrobble(
+            constants.SCROBBLE_PROGRESS_ENDPOINT,
+            {"event_id": "progress-1"},
+        )
+        scrobble_id = int(cache.get_pending_scrobbles()[0]["id"])
+
+        self.assertTrue(cache.pending_scrobble_exists(scrobble_id))
+
+        cache.delete_pending_scrobble(scrobble_id)
+
+        self.assertFalse(cache.pending_scrobble_exists(scrobble_id))
 
     def test_retry_metadata_is_recorded(self) -> None:
         cache = cache_module.Cache()

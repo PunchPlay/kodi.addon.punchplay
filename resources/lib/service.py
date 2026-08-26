@@ -183,14 +183,13 @@ class PunchPlayService(xbmc.Monitor):
                 xbmc.log("[PunchPlay] Library sync triggered from settings", xbmc.LOGINFO)
                 self._sync_kodi_library()
 
-            # Flush offline queue periodically.
+            # Flush offline queue periodically. Routed through the player's
+            # post worker (not called on this thread) so it can never run
+            # concurrently with a flush the worker is already doing ahead of
+            # a playback start — see PunchPlayPlayer.dispatch_flush().
             if self._api.is_authenticated() and (now - self._last_flush >= FLUSH_INTERVAL_SECS):
-                try:
-                    self._api.flush_queue()
-                except Exception as exc:
-                    xbmc.log(f"[PunchPlay] Queue flush error: {exc}", xbmc.LOGWARNING)
-                else:
-                    self._last_flush = now
+                self._player.dispatch_flush()
+                self._last_flush = now
 
             # Show a queued rating prompt once its delay has elapsed.  The
             # player queues these instead of blocking its callback thread.
@@ -432,17 +431,11 @@ class PunchPlayService(xbmc.Monitor):
             f"[PunchPlay] Pushing {len(entries)} watched toggle(s) to PunchPlay",
             xbmc.LOGINFO,
         )
-        resp = self._api.post(SCROBBLE_IMPORT_ENDPOINT, {"entries": entries})
-        if resp is not None:
-            xbmc.log(
-                "[PunchPlay] Watched toggle import: {0} imported, {1} duplicate(s), "
-                "{2} unmatched".format(
-                    resp.get("imported", 0),
-                    resp.get("skipped_duplicates", 0),
-                    resp.get("unmatched", 0),
-                ),
-                xbmc.LOGINFO,
-            )
+        # Routed through the player's post worker rather than posted here —
+        # this runs on the service loop's own thread, which must stay free
+        # for login/logout handling, dispatch_flush()'s periodic trigger, and
+        # rating-prompt draining, not blocked on a network round trip.
+        self._player.dispatch_import(entries)
 
     def _maybe_scan_pull_sync(self, now: float) -> None:
         settings = self._pull_sync_settings()
@@ -550,6 +543,12 @@ class PunchPlayService(xbmc.Monitor):
         except Exception as exc:
             if progress is not None:
                 progress.close()
+            if since_ms is None:
+                # A manual/scan-triggered full pull may have been needed to
+                # apply history older than the previous incremental cursor.
+                # Keep the next automatic run full too instead of silently
+                # falling back to that stale cursor after this failure.
+                self._cache.clear_pull_sync_checkpoint()
             xbmc.log(f"[PunchPlay] Pull sync failed: {exc}", xbmc.LOGWARNING)
             if manual:
                 xbmcgui.Dialog().notification(
@@ -594,6 +593,11 @@ class PunchPlayService(xbmc.Monitor):
             # a new or unrelated failure always starts at run one.
             held_runs = self._cache.record_pull_sync_held(failed_items)
             if held_runs < PULL_SYNC_MAX_HELD_RUNS:
+                if since_ms is None:
+                    # A failed item in a full pull can predate the previous
+                    # incremental checkpoint. Clearing it ensures the next
+                    # automatic run fetches that item again.
+                    self._cache.clear_pull_sync_checkpoint()
                 xbmc.log(
                     f"[PunchPlay] Pull sync finished with {apply_failed} apply "
                     f"failure(s) ({held_runs}/{PULL_SYNC_MAX_HELD_RUNS}), "

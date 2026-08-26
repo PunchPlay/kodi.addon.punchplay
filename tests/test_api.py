@@ -108,6 +108,10 @@ class _FakeCache:
         self.identify_results: list[tuple[str, str, float | None]] = []
         self.enqueued: list[tuple[str, dict[str, object]]] = []
         self.queue_cleared = False
+        self.pending: list[dict[str, object]] = []
+        self.existing_ids: set[int] = set()
+        self.deleted_ids: list[int] = []
+        self.expired_dropped = 0
 
     def get_identifier(self, key: str) -> dict[str, object] | None:
         return self.store.get(key)
@@ -143,6 +147,27 @@ class _FakeCache:
 
     def set_account_username(self, username: str | None) -> None:
         _ = username
+
+    # -- pending-scrobble queue (flush_queue) --------------------------
+    def add_pending(self, item: dict[str, object]) -> None:
+        self.pending.append(item)
+        self.existing_ids.add(item["id"])
+
+    def drop_expired_pending_scrobbles(self) -> int:
+        return self.expired_dropped
+
+    def get_pending_scrobbles(self) -> list[dict[str, object]]:
+        return [item for item in self.pending if item["id"] in self.existing_ids]
+
+    def delete_pending_scrobble(self, scrobble_id: int) -> None:
+        self.deleted_ids.append(scrobble_id)
+        self.existing_ids.discard(scrobble_id)
+
+    def mark_pending_scrobble_attempt(self, scrobble_id: int, error: str) -> None:
+        _ = scrobble_id, error
+
+    def pending_scrobble_exists(self, scrobble_id: int) -> bool:
+        return scrobble_id in self.existing_ids
 
 
 class APIValidationTests(unittest.TestCase):
@@ -406,6 +431,51 @@ class TokenRefreshTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual(refresh_tokens, ["refresh-1"])
 
+    def test_refresh_request_sends_the_same_user_agent_as_every_other_call(self) -> None:
+        # The refresh call used to build its own bare headers dict, skipping
+        # the User-Agent every other request sends. A default urllib
+        # User-Agent is a common bot-mitigation signature at the network
+        # edge — this call was getting rejected with a 403 before ever
+        # reaching the backend route, in production, on every single attempt.
+        class _Response:
+            def __init__(self, payload: dict[str, str]) -> None:
+                self._raw = json.dumps(payload).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self._raw
+
+        captured_headers: dict[str, str] = {}
+
+        def _urlopen(request, timeout=0):
+            _ = timeout
+            captured_headers.update(request.headers)
+            return _Response({"access_token": "access-2", "refresh_token": "refresh-2"})
+
+        original_urlopen = api_module.urllib.request.urlopen
+        self.addCleanup(
+            setattr, api_module.urllib.request, "urlopen", original_urlopen
+        )
+        api_module.urllib.request.urlopen = _urlopen
+
+        refreshed = self.client._do_refresh("expired-access", self.client._auth_generation)
+
+        self.assertTrue(refreshed)
+        # urllib.Request lower-cases none of this; header keys arrive
+        # capitalized-first (e.g. "User-agent") via Request.headers.
+        user_agent = next(
+            (v for k, v in captured_headers.items() if k.lower() == "user-agent"),
+            None,
+        )
+        self.assertIsNotNone(user_agent)
+        self.assertIn("script.punchplay", user_agent)
+        self.assertNotIn("python-urllib", (user_agent or "").lower())
+
 
 class LogoutGenerationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -460,6 +530,21 @@ class LogoutGenerationTests(unittest.TestCase):
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, [None])
+        self.assertTrue(self.cache.queue_cleared)
+        self.assertEqual(self.cache.enqueued, [])
+
+    def test_logout_prevents_queue_full_stop_from_repopulating_queue(self) -> None:
+        originating_generation = self.client.auth_generation
+
+        self.assertTrue(self.client.logout())
+
+        self.assertFalse(
+            self.client.preserve_post_for_retry(
+                "/api/scrobble/stop",
+                {"event_id": "old-event"},
+                expected_auth_generation=originating_generation,
+            )
+        )
         self.assertTrue(self.cache.queue_cleared)
         self.assertEqual(self.cache.enqueued, [])
 
@@ -528,6 +613,110 @@ class LogoutGenerationTests(unittest.TestCase):
         self.assertEqual(result, [None])
         self.assertEqual(authorizations, ["Bearer old-account-access"])
         self.assertEqual(self.cache.enqueued, [])
+
+
+class FlushQueueTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.mkdtemp(prefix="punchplay-api-tests-")
+        self.fake_addon = _FakeAddon()
+        self.original_get_addon = api_module.get_addon
+        self.original_get_profile_dir = api_module.get_profile_dir
+        self.original_get_addon_version = api_module.get_addon_version
+        api_module.get_addon = lambda: self.fake_addon
+        api_module.get_profile_dir = lambda: self.temp_dir
+        api_module.get_addon_version = lambda: "1.3.0"
+        self.cache = _FakeCache()
+        self.client = api_module.APIClient(cache=self.cache)
+
+    def tearDown(self) -> None:
+        api_module.get_addon = self.original_get_addon
+        api_module.get_profile_dir = self.original_get_profile_dir
+        api_module.get_addon_version = self.original_get_addon_version
+        shutil.rmtree(self.temp_dir)
+
+    def test_flush_replays_a_row_that_still_exists(self) -> None:
+        self.cache.add_pending(
+            {"id": 1, "endpoint": "/api/scrobble/progress", "payload": {"event_id": "a"}}
+        )
+        requests_made: list[str] = []
+        self.client._request = lambda method, path, payload=None, **kwargs: (  # type: ignore[method-assign]
+            requests_made.append(path) or {}
+        )
+
+        completed = self.client.flush_queue()
+
+        self.assertTrue(completed)
+        self.assertEqual(requests_made, ["/api/scrobble/progress"])
+        self.assertEqual(self.cache.deleted_ids, [1])
+
+    def test_flush_skips_a_row_deleted_out_from_under_it(self) -> None:
+        # Reproduces the race a PR review comment flagged: the service's
+        # periodic flush_queue() snapshots pending rows via
+        # get_pending_scrobbles(), then a concurrent onPlayBackEnded's
+        # _send_stop() calls delete_pending_scrobbles_for_session() for
+        # the same item before flush_queue gets to it. Replaying it
+        # anyway would resend a stale progress event to the backend after
+        # the authoritative stop already landed.
+        self.cache.add_pending(
+            {"id": 1, "endpoint": "/api/scrobble/progress", "payload": {"event_id": "stale"}}
+        )
+        # It existed in the snapshot, then disappeared before the replay
+        # loop's live-row check.
+        self.cache.pending_scrobble_exists = lambda scrobble_id: False
+
+        requests_made: list[str] = []
+        self.client._request = lambda method, path, payload=None, **kwargs: (  # type: ignore[method-assign]
+            requests_made.append(path) or {}
+        )
+
+        completed = self.client.flush_queue()
+
+        self.assertTrue(completed)
+        self.assertEqual(requests_made, [])
+        self.assertEqual(self.cache.deleted_ids, [])
+
+    def test_flush_stops_when_account_changes_mid_flush(self) -> None:
+        # pending_scrobbles rows carry no per-row account identity, so a
+        # flush spanning a logout+relogin to a different account must not
+        # send a later row under whatever account is active by the time the
+        # loop reaches it — it belongs to the generation the flush started
+        # with. _request() raises AuthenticationChangedError when the
+        # account no longer matches expected_auth_generation; the loop must
+        # stop there rather than continuing to the next row.
+        self.cache.add_pending(
+            {"id": 1, "endpoint": "/api/scrobble/progress", "payload": {"event_id": "a"}}
+        )
+        self.cache.add_pending(
+            {"id": 2, "endpoint": "/api/scrobble/progress", "payload": {"event_id": "b"}}
+        )
+        requests_made: list[str] = []
+
+        def _fake_request(method, path, payload=None, **kwargs):
+            requests_made.append(path)
+            if len(requests_made) == 2:
+                raise api_module.AuthenticationChangedError("account changed")
+            return {}
+
+        self.client._request = _fake_request  # type: ignore[method-assign]
+
+        completed = self.client.flush_queue(expected_auth_generation=0)
+
+        self.assertFalse(completed)
+        self.assertEqual(len(requests_made), 2)
+        self.assertEqual(self.cache.deleted_ids, [1])
+
+    def test_flush_reports_incomplete_after_a_transient_failure(self) -> None:
+        self.cache.add_pending(
+            {"id": 1, "endpoint": "/api/scrobble/stop", "payload": {"event_id": "a"}}
+        )
+        self.client._request = (  # type: ignore[method-assign]
+            lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("offline"))
+        )
+
+        completed = self.client.flush_queue()
+
+        self.assertFalse(completed)
+        self.assertEqual(self.cache.deleted_ids, [])
 
 
 if __name__ == "__main__":

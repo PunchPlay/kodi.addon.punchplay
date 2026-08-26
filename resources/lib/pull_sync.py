@@ -156,14 +156,16 @@ def should_apply_resume(
     if abs(kodi_position - position) < RESUME_MIN_DELTA_SECS:
         return False
 
-    # If Kodi has its own playback state, only overwrite when the remote
-    # progress is newer.  `lastplayed` updates whenever Kodi stops playback,
-    # so it is a usable proxy for the local resume point's age.
-    if kodi_position > 0:
-        kodi_epoch = kodi_datetime_to_epoch(kodi_item.get("lastplayed"))
-        remote_epoch = iso_to_epoch(remote.get("updated_at"))
-        if kodi_epoch is not None and remote_epoch is not None and kodi_epoch >= remote_epoch:
-            return False
+    # Only overwrite when the remote progress is newer. `lastplayed` updates
+    # whenever Kodi stops playback — including finishing an item, which
+    # clears its resume position to 0 — so it's a usable proxy for the local
+    # state's age regardless of the current resume position. Gating this on
+    # kodi_position > 0 would let a stale remote in-progress position
+    # resurrect a resume marker on an item already completed locally.
+    kodi_epoch = kodi_datetime_to_epoch(kodi_item.get("lastplayed"))
+    remote_epoch = iso_to_epoch(remote.get("updated_at"))
+    if kodi_epoch is not None and remote_epoch is not None and kodi_epoch >= remote_epoch:
+        return False
     return True
 
 

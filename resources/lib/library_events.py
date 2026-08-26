@@ -40,8 +40,12 @@ class LibraryDetailLookupError(RuntimeError):
 
 def parse_video_library_update(data: str | None) -> dict[str, Any] | None:
     """
-    Parse a VideoLibrary.OnUpdate payload into a watched-toggle event, or
-    None when the update is not a manual watched change.
+    Parse a VideoLibrary.OnUpdate payload into a playcount-change event, or
+    None when the update carries no playcount at all (metadata-only, not a
+    toggle of any kind). A playcount of 0 (un-watch) is still returned —
+    LiveWatchedSync.push_update needs to see it to cancel a not-yet-sent
+    watched toggle for the same item, even though it's never queued for
+    upload itself.
     """
     if not data:
         return None
@@ -57,9 +61,8 @@ def parse_video_library_update(data: str | None) -> dict[str, Any] | None:
         return None
 
     playcount = payload.get("playcount")
-    if not isinstance(playcount, int) or playcount <= 0:
-        # Missing playcount = metadata-only update; 0 = un-watch (ignored —
-        # we never delete PunchPlay history from a Kodi toggle).
+    if not isinstance(playcount, int):
+        # Missing playcount = metadata-only update, not a toggle at all.
         return None
 
     # Kodi versions differ: item fields nested under "item" or at top level.
@@ -92,13 +95,27 @@ class LiveWatchedSync:
         with self._lock:
             for key in applied:
                 self._pull_applied[key] = now
+            # pop_due_events() also prunes this dict, but only runs when
+            # there's a live-toggle event to pop — a user with pull sync on
+            # and live watched sync off (or simply idle) would otherwise
+            # never hit that path, and this dict would grow for the
+            # lifetime of the service. Prune here too so it can't.
+            self._prune_pull_applied_locked(now)
+
+    def _prune_pull_applied_locked(self, now: float) -> None:
+        """Caller must hold self._lock."""
+        cutoff = now - LIVE_SYNC_ECHO_SUPPRESS_SECS
+        self._pull_applied = {
+            key: applied_at
+            for key, applied_at in self._pull_applied.items()
+            if applied_at >= cutoff
+        }
 
     def push_update(self, data: str | None) -> None:
         """Queue a raw OnUpdate payload.  Safe from Kodi's announce thread."""
         event = parse_video_library_update(data)
         if event is None:
             return
-        event["at"] = time.monotonic()
         key = (event["item_type"], event["library_id"])
         with self._lock:
             # Coalesce repeated toggles of the same item — keep the latest.
@@ -107,13 +124,29 @@ class LiveWatchedSync:
                 for existing in self._events
                 if (existing["item_type"], existing["library_id"]) != key
             ]
-            self._events.append(event)
-        xbmc.log(
-            "[PunchPlay] Watched toggle queued: {0} #{1} playcount={2}".format(
-                event["item_type"], event["library_id"], event["playcount"]
-            ),
-            xbmc.LOGDEBUG,
-        )
+            queued = event["playcount"] > 0
+            if queued:
+                event["at"] = time.monotonic()
+                self._events.append(event)
+        if queued:
+            xbmc.log(
+                "[PunchPlay] Watched toggle queued: {0} #{1} playcount={2}".format(
+                    event["item_type"], event["library_id"], event["playcount"]
+                ),
+                xbmc.LOGDEBUG,
+            )
+        else:
+            # We never delete PunchPlay history from a Kodi un-watch, but it
+            # must still cancel a not-yet-sent watched toggle for the same
+            # item queued moments earlier — otherwise marking something
+            # watched and reversing it within the debounce window still
+            # uploads the watch the user immediately undid.
+            xbmc.log(
+                "[PunchPlay] Un-watch cancelled pending toggle: {0} #{1}".format(
+                    event["item_type"], event["library_id"]
+                ),
+                xbmc.LOGDEBUG,
+            )
 
     def pending_count(self) -> int:
         with self._lock:
@@ -177,12 +210,7 @@ class LiveWatchedSync:
             ]
 
             # Prune stale pull-applied suppressions while we hold the lock.
-            cutoff = current - LIVE_SYNC_ECHO_SUPPRESS_SECS
-            self._pull_applied = {
-                key: applied_at
-                for key, applied_at in self._pull_applied.items()
-                if applied_at >= cutoff
-            }
+            self._prune_pull_applied_locked(current)
             pull_applied = dict(self._pull_applied)
 
         recent = recent_library_items or []

@@ -323,11 +323,11 @@ class LiveWatchedRetryTests(unittest.TestCase):
         )
         posted: list[dict[str, object]] = []
         svc = service.PunchPlayService.__new__(service.PunchPlayService)
-        svc._api = types.SimpleNamespace(
-            is_authenticated=lambda: True,
-            post=lambda endpoint, payload: posted.append(payload) or {},
+        svc._api = types.SimpleNamespace(is_authenticated=lambda: True)
+        svc._player = types.SimpleNamespace(
+            recent_library_items=lambda: [],
+            dispatch_import=lambda entries: posted.append({"entries": entries}),
         )
-        svc._player = types.SimpleNamespace(recent_library_items=lambda: [])
         svc._live_sync = types.SimpleNamespace(
             pending_count=lambda: 1,
             pop_due_events=lambda recent: [event],
@@ -468,6 +468,32 @@ class PullSyncCheckpointTests(unittest.TestCase):
         status = self.cache.get_runtime_status()
         self.assertIsNotNone(status["last_pull_sync_at"])
         self.assertEqual(status["pull_sync_held_runs"], 0)
+
+    def test_full_pull_failure_clears_an_older_incremental_checkpoint(self) -> None:
+        self.cache.record_pull_sync("previous incremental run")
+
+        def _run(*args, **kwargs):
+            _ = args
+            kwargs["failed_out"].add("movie-old")
+            return _pull_sync_summary(apply_failed=1)
+
+        self.pull_sync_module.run_pull_sync = _run
+
+        self._svc()._pull_sync(manual=True)
+
+        status = self.cache.get_runtime_status()
+        self.assertIsNone(status["last_pull_sync_at"])
+        self.assertEqual(status["pull_sync_held_runs"], 1)
+
+    def test_full_pull_exception_clears_an_older_incremental_checkpoint(self) -> None:
+        self.cache.record_pull_sync("previous incremental run")
+        self.pull_sync_module.run_pull_sync = (
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline"))
+        )
+
+        self._svc()._pull_sync(manual=False)
+
+        self.assertIsNone(self.cache.get_runtime_status()["last_pull_sync_at"])
 
     def test_new_failed_item_gets_its_own_retry_allowance(self) -> None:
         failures = [

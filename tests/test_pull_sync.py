@@ -118,6 +118,18 @@ class ShouldApplyResumeTests(unittest.TestCase):
         }
         self.assertTrue(pull_sync.should_apply_resume(remote, kodi_item))
 
+    def test_skips_stale_remote_position_on_a_locally_completed_item(self) -> None:
+        # Finishing an item locally clears its resume position to 0 while
+        # still updating lastplayed. A remote in-progress position from
+        # before that completion must not resurrect a resume marker just
+        # because the local resume position happens to be zero.
+        remote = self._remote(updated_at="2020-01-01T00:00:00Z")
+        kodi_item = {
+            "resume": {"position": 0},
+            "lastplayed": "2026-07-09 12:00:00",
+        }
+        self.assertFalse(pull_sync.should_apply_resume(remote, kodi_item))
+
 
 class LibraryIndexTests(unittest.TestCase):
     def setUp(self) -> None:

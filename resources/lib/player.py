@@ -32,6 +32,7 @@ from constants import (
     POST_QUEUE_MAX_ITEMS,
     POST_QUEUE_PUT_TIMEOUT_SECS,
     POST_WORKER_JOIN_TIMEOUT_SECS,
+    SCROBBLE_IMPORT_ENDPOINT,
     SCROBBLE_PAUSE_ENDPOINT,
     SCROBBLE_PROGRESS_ENDPOINT,
     SCROBBLE_RATE_ENDPOINT,
@@ -74,13 +75,15 @@ def build_rating_suppression_keys(metadata: dict[str, Any]) -> dict[str, str]:
         )
     }
     if media_type == "episode":
-        # Episode IDs differ from one episode to the next, so they cannot
-        # identify a show-wide suppression. The normalised show title/year is
-        # stable across its episodes and still distinguishes most remakes.
-        keys["show"] = "show:{0}:{1}".format(
-            title,
-            year,
-        )
+        # None of punchplay_id/tmdb_id/tvdb_id/imdb_id identify the show —
+        # they come from Kodi's per-episode uniqueid (or the backend's
+        # per-episode title record), so `canonical_id` differs from one
+        # episode to the next just like the old per-episode `year` did.
+        # `title` is the one field that's already show-level here: Kodi's
+        # info tag reports the show's title for every episode
+        # (getTVShowTitle()), not the episode's own title, so it's the only
+        # value in this metadata that's actually stable across a show.
+        keys["show"] = "show:{0}".format(title)
     return keys
 
 
@@ -91,12 +94,25 @@ def has_reliable_rating_identity(metadata: dict[str, Any]) -> bool:
 class _PostJob(NamedTuple):
     """A queued scrobble post. `endpoint`/`payload` describe the network
     write so a job that never got to run can still be persisted to the
-    offline queue at shutdown; `run` is what the worker actually executes."""
+    offline queue at shutdown; `run` is what the worker actually executes.
+
+    `offline_fallback`, if set, runs instead of being silently dropped when
+    the post queue is full — it must never attempt a real network call
+    (it runs on whatever thread hit queue.Full, which must not block), only
+    cheap local work plus persisting to the offline queue for later replay.
+    """
 
     endpoint: str
     payload: dict[str, Any]
     auth_generation: int
     run: Callable[[], None]
+    offline_fallback: Callable[[], None] | None = None
+
+
+# Not a real endpoint — marks a queue-drain job (see dispatch_flush) so
+# _persist_unsent_queue can recognise and skip it instead of persisting a
+# bogus pending_scrobbles row with this as its "endpoint".
+_FLUSH_QUEUE_SENTINEL = "__internal_flush_offline_queue__"
 
 
 class PunchPlayPlayer(xbmc.Player):
@@ -130,6 +146,12 @@ class PunchPlayPlayer(xbmc.Player):
         self._post_thread_lock = threading.Lock()
         self._post_state_lock = threading.Lock()
         self._active_post_job: _PostJob | None = None
+        # Sessions in this set have at least one event in the durable queue.
+        # Every later event for the same session must stay durable until a
+        # complete flush succeeds, otherwise it could overtake the older row.
+        self._deferred_sessions_lock = threading.Lock()
+        self._deferred_sessions: set[str] = set()
+        self._deferred_sessions_revision = 0
         # Set only after shutdown's grace period expires. It prevents the
         # worker from taking another queued job while cleanup snapshots the
         # active job and drains the backlog to SQLite.
@@ -368,10 +390,232 @@ class PunchPlayPlayer(xbmc.Player):
             # thread, and still lets a briefly backed-up queue drain.
             self._post_queue.put(job, timeout=POST_QUEUE_PUT_TIMEOUT_SECS)
         except queue.Full:
+            if job.offline_fallback is not None:
+                try:
+                    job.offline_fallback()
+                except Exception as exc:
+                    xbmc.log(
+                        f"[PunchPlay] Post queue full — offline fallback for "
+                        f"{job.endpoint} failed: {exc}",
+                        xbmc.LOGWARNING,
+                    )
+                else:
+                    xbmc.log(
+                        f"[PunchPlay] Post queue full — ran offline fallback for "
+                        f"{job.endpoint}",
+                        xbmc.LOGWARNING,
+                    )
+                return
             xbmc.log(
                 "[PunchPlay] Post queue full — dropping event to keep playback smooth",
                 xbmc.LOGWARNING,
             )
+
+    def _mark_session_deferred(self, session_id: str | None) -> None:
+        if not session_id:
+            return
+        with self._deferred_sessions_lock:
+            self._deferred_sessions.add(session_id)
+            self._deferred_sessions_revision += 1
+
+    def _session_is_deferred(self, session_id: str | None) -> bool:
+        if not session_id:
+            return False
+        with self._deferred_sessions_lock:
+            return session_id in self._deferred_sessions
+
+    def _clear_deferred_sessions(self) -> None:
+        with self._deferred_sessions_lock:
+            self._deferred_sessions.clear()
+            self._deferred_sessions_revision += 1
+
+    def _deferred_sessions_snapshot(self) -> int:
+        with self._deferred_sessions_lock:
+            return self._deferred_sessions_revision
+
+    def _clear_deferred_sessions_if_unchanged(self, revision: int) -> None:
+        """Clear only when no callback deferred another event mid-flush."""
+        with self._deferred_sessions_lock:
+            if self._deferred_sessions_revision == revision:
+                self._deferred_sessions.clear()
+                self._deferred_sessions_revision += 1
+
+    def _preserve_playback_post(
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+        auth_generation: int,
+        session_id: str | None,
+    ) -> bool:
+        """Keep a playback event behind the durable ordering barrier."""
+        self._mark_session_deferred(session_id)
+        return self._api.preserve_post_for_retry(
+            endpoint,
+            payload,
+            expected_auth_generation=auth_generation,
+        )
+
+    def _flush_queue_safely(self, auth_generation: int) -> bool:
+        """Return False for any failed drain so ordering callers fail shut."""
+        try:
+            return self._api.flush_queue(
+                expected_auth_generation=auth_generation
+            )
+        except Exception as exc:
+            xbmc.log(
+                f"[PunchPlay] Offline queue flush failed: {exc}",
+                xbmc.LOGWARNING,
+            )
+            return False
+
+    def dispatch_flush(self) -> None:
+        """Drain any offline-queued events on the post worker.
+
+        This is the *only* code path that should call APIClient.flush_queue()
+        — both the service loop's periodic 60s timer and the pre-start drain
+        in onAVStarted go through this, so every flush lands on the same
+        single-threaded worker as every playback post. A second, independent
+        call site (e.g. the service loop calling flush_queue() directly on
+        its own thread) could run concurrently with a worker-thread flush:
+        both would see the same pending row via pending_scrobble_exists()
+        before either deletes it, and the independent thread's request could
+        land on the backend after a start the worker already sent, right
+        back to the ordering bug this exists to prevent. Funnelling
+        everything through the worker makes that impossible — flush and
+        start jobs simply queue up and run in enqueue order, and the worker
+        still executes them off Kodi's callback thread either way.
+        """
+        auth_generation = self._api.auth_generation
+
+        def _run() -> None:
+            revision = self._deferred_sessions_snapshot()
+            if self._flush_queue_safely(auth_generation):
+                self._clear_deferred_sessions_if_unchanged(revision)
+
+        self._dispatch(
+            _PostJob(
+                _FLUSH_QUEUE_SENTINEL,
+                {},
+                auth_generation,
+                _run,
+            )
+        )
+
+    def dispatch_import(self, entries: list[dict[str, Any]]) -> None:
+        """Push a batch of live watched-toggle entries through the post
+        worker instead of blocking the caller's thread.
+
+        The service loop used to call APIClient.post() for this directly on
+        its own thread — up to REQUEST_TIMEOUT_SECS (longer after a 401
+        retry) blocking that thread's login/logout handling, dispatch_flush's
+        periodic trigger, and rating-prompt draining, while also writing into
+        the offline queue from a thread independent of the post worker on
+        failure. Routing it here keeps every network write in this addon on
+        the single worker thread instead.
+        """
+        auth_generation = self._api.auth_generation
+
+        def _run() -> None:
+            resp = self._api.post(
+                SCROBBLE_IMPORT_ENDPOINT,
+                {"entries": entries},
+                expected_auth_generation=auth_generation,
+            )
+            if resp is not None:
+                xbmc.log(
+                    "[PunchPlay] Watched toggle import: {0} imported, {1} "
+                    "duplicate(s), {2} unmatched".format(
+                        resp.get("imported", 0),
+                        resp.get("skipped_duplicates", 0),
+                        resp.get("unmatched", 0),
+                    ),
+                    xbmc.LOGINFO,
+                )
+
+        self._dispatch(
+            _PostJob(
+                SCROBBLE_IMPORT_ENDPOINT,
+                {"entries": entries},
+                auth_generation,
+                _run,
+                offline_fallback=lambda: self._api.preserve_post_for_retry(
+                    SCROBBLE_IMPORT_ENDPOINT,
+                    {"entries": entries},
+                    expected_auth_generation=auth_generation,
+                ),
+            )
+        )
+
+    def _dispatch_start(self, payload: dict[str, Any]) -> None:
+        """Drain the offline queue before allowing a new start to overtake it.
+
+        Flush and start live in one worker job so queue saturation cannot
+        split the barrier. If the job cannot be enqueued, or the drain stops
+        on a transient failure, the start is persisted instead; later events
+        for its session stay durable until a complete flush succeeds.
+        """
+        auth_generation = self._playback_auth_generation
+        if auth_generation is None:
+            xbmc.log(
+                f"[PunchPlay] Discarding {SCROBBLE_START_ENDPOINT} without an "
+                "active login session",
+                xbmc.LOGDEBUG,
+            )
+            return
+        session_id = str(payload.get("playback_session_id") or "") or None
+
+        def _run() -> None:
+            # A queue-full fallback from a later callback may already have
+            # made this session durable before its start job reached the
+            # worker. Persist the start too, then replay the whole session in
+            # event_created_at order instead of sending the start last.
+            if self._session_is_deferred(session_id):
+                self._preserve_playback_post(
+                    SCROBBLE_START_ENDPOINT,
+                    payload,
+                    auth_generation,
+                    session_id,
+                )
+                revision = self._deferred_sessions_snapshot()
+                if self._flush_queue_safely(auth_generation):
+                    self._clear_deferred_sessions_if_unchanged(revision)
+                return
+
+            revision = self._deferred_sessions_snapshot()
+            if not self._flush_queue_safely(auth_generation):
+                # The old backlog is still live. Persist this start behind it
+                # and keep every following event from overtaking either one.
+                self._preserve_playback_post(
+                    SCROBBLE_START_ENDPOINT,
+                    payload,
+                    auth_generation,
+                    session_id,
+                )
+                return
+
+            self._clear_deferred_sessions_if_unchanged(revision)
+            response = self._api.post(
+                SCROBBLE_START_ENDPOINT,
+                payload,
+                expected_auth_generation=auth_generation,
+            )
+            if response is None:
+                self._mark_session_deferred(session_id)
+
+        self._dispatch(
+            _PostJob(
+                SCROBBLE_START_ENDPOINT,
+                payload,
+                auth_generation,
+                _run,
+                offline_fallback=lambda: self._preserve_playback_post(
+                    SCROBBLE_START_ENDPOINT,
+                    payload,
+                    auth_generation,
+                    session_id,
+                ),
+            )
+        )
 
     def _dispatch_post(self, endpoint: str, payload: dict[str, Any]) -> None:
         auth_generation = self._playback_auth_generation
@@ -381,15 +625,36 @@ class PunchPlayPlayer(xbmc.Player):
                 xbmc.LOGDEBUG,
             )
             return
+        session_id = str(payload.get("playback_session_id") or "") or None
+
+        def _run() -> None:
+            if self._session_is_deferred(session_id):
+                self._preserve_playback_post(
+                    endpoint,
+                    payload,
+                    auth_generation,
+                    session_id,
+                )
+                return
+            response = self._api.post(
+                endpoint,
+                payload,
+                expected_auth_generation=auth_generation,
+            )
+            if response is None:
+                self._mark_session_deferred(session_id)
+
         self._dispatch(
             _PostJob(
                 endpoint,
                 payload,
                 auth_generation,
-                lambda: self._api.post(
+                _run,
+                offline_fallback=lambda: self._preserve_playback_post(
                     endpoint,
                     payload,
-                    expected_auth_generation=auth_generation,
+                    auth_generation,
+                    session_id,
                 ),
             )
         )
@@ -567,10 +832,12 @@ class PunchPlayPlayer(xbmc.Player):
                 xbmc.LOGINFO,
             )
 
-            # The service loop flushes the offline queue every 60s; doing it
-            # here too would replay up to 500 queued posts on Kodi's player
-            # callback thread, stalling playback callbacks behind them.
-            self._dispatch_post(SCROBBLE_START_ENDPOINT, payload)
+            # Drains the offline queue and posts the start as one atomic
+            # worker job (see _dispatch_start) so a stale leftover event
+            # can't land after this one, even under a full post queue. The
+            # service loop also flushes the offline queue every 60s, through
+            # dispatch_flush() on the same worker.
+            self._dispatch_start(payload)
             self._start_heartbeat()
 
         except Exception as exc:
@@ -631,20 +898,41 @@ class PunchPlayPlayer(xbmc.Player):
         session_id: str | None,
         auth_generation: int,
         watched: bool,
+        attempt_network: bool = True,
     ) -> None:
         """
         Post the stop event and queue any rating prompt.  Runs on the post
         worker, so it may block on the network and on SQLite.  Shows no UI —
         the service loop drains the queued prompt and displays it.
+
+        *attempt_network* is False when this is the offline fallback for a
+        queue-full job, or when an earlier event from the same session is
+        already durable. In both cases this goes straight to the offline
+        queue. Everything else below (session cleanup and rating prompt)
+        still needs to run, which is why the fallback comes through here.
         """
         if session_id and self._cache is not None:
             self._cache.delete_pending_scrobbles_for_session(session_id)
 
-        stop_resp = self._api.post(
-            SCROBBLE_STOP_ENDPOINT,
-            payload,
-            expected_auth_generation=auth_generation,
-        )
+        if self._session_is_deferred(session_id):
+            attempt_network = False
+
+        if attempt_network:
+            stop_resp = self._api.post(
+                SCROBBLE_STOP_ENDPOINT,
+                payload,
+                expected_auth_generation=auth_generation,
+            )
+            if stop_resp is None:
+                self._mark_session_deferred(session_id)
+        else:
+            self._preserve_playback_post(
+                SCROBBLE_STOP_ENDPOINT,
+                payload,
+                auth_generation,
+                session_id,
+            )
+            stop_resp = None
 
         # logout() invalidates all work from the previous account. The HTTP
         # request may already have completed, but its response must not create
@@ -734,6 +1022,15 @@ class PunchPlayPlayer(xbmc.Player):
                         session_id=session_id,
                         auth_generation=auth_generation,
                         watched=watched,
+                    ),
+                    offline_fallback=lambda: self._send_stop(
+                        payload=payload,
+                        metadata=metadata,
+                        settings=settings,
+                        session_id=session_id,
+                        auth_generation=auth_generation,
+                        watched=watched,
+                        attempt_network=False,
                     ),
                 )
             )
@@ -943,6 +1240,7 @@ class PunchPlayPlayer(xbmc.Player):
         self._playback_session_id = None
         self._playback_auth_generation = None
         self._stop_emitted = False
+        self._clear_deferred_sessions()
         with self._rating_lock:
             self._pending_rating = None
 
@@ -967,12 +1265,13 @@ class PunchPlayPlayer(xbmc.Player):
     # ------------------------------------------------------------------
 
     def cleanup(self) -> None:
-        self._is_playing = False
-        self._stop_heartbeat()
-        self._metadata = None
-        self._playback_session_id = None
-        self._playback_auth_generation = None
-        self._stop_emitted = False
+        # If something is still playing when Kodi quits, onPlayBackStopped/
+        # onPlayBackEnded never fire — they only cover playback ending while
+        # Kodi keeps running. Without this, the item is silently left in
+        # "now playing" state on the backend forever: _handle_stop is the
+        # only code path that actually emits the stop event, so shutdown
+        # must go through it instead of just clearing local state.
+        self._handle_stop()
         with self._rating_lock:
             self._pending_rating = None
         self._stop_post_worker()
@@ -1036,11 +1335,16 @@ class PunchPlayPlayer(xbmc.Player):
                 job = self._post_queue.get_nowait()
             except queue.Empty:
                 break
-            if job is not None and job.auth_generation == self._api.auth_generation:
+            if (
+                job is not None
+                and job.endpoint != _FLUSH_QUEUE_SENTINEL
+                and job.auth_generation == self._api.auth_generation
+            ):
                 jobs.append(job)
             self._post_queue.task_done()
         if (
             active_job is not None
+            and active_job.endpoint != _FLUSH_QUEUE_SENTINEL
             and active_job.auth_generation == self._api.auth_generation
         ):
             jobs.append(active_job)

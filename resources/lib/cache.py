@@ -97,6 +97,7 @@ class Cache:
             self._migrate_identifier_cache(conn)
             self._migrate_pending_scrobbles(conn)
             self._migrate_runtime_status(conn)
+            self._migrate_rating_suppression_keys(conn)
 
     def _migrate_identifier_cache(self, conn: sqlite3.Connection) -> None:
         existing_columns = {
@@ -171,6 +172,36 @@ class Cache:
                 conn.execute(
                     f"ALTER TABLE runtime_status ADD COLUMN {column_name} {column_type}"
                 )
+
+    def _migrate_rating_suppression_keys(self, conn: sqlite3.Connection) -> None:
+        """One-time cleanup for the 1.5.2 show-suppression key format
+        change: `show:{id-or-title}:{title}:{year}` -> `show:{title}`.
+
+        The old key varied almost as much per episode as the field it
+        replaced (an episode-level id or year, not a show-level one), so
+        rows written under it rarely matched reliably in the first place.
+        There's no safe way to rewrite an old key into the new format when
+        a title itself may contain colons, so old rows are cleared rather
+        than migrated — the user re-suppresses if they still want to.
+
+        Gated on PRAGMA user_version so this runs exactly once rather than
+        on every launch (a real show:{title} key can itself contain extra
+        colons if the title does, and would otherwise match the old
+        format's pattern forever).
+        """
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version >= 1:
+            return
+        deleted = conn.execute(
+            "DELETE FROM rating_suppressions WHERE key GLOB 'show:*:*:*'"
+        ).rowcount
+        if deleted:
+            xbmc.log(
+                f"[PunchPlay] Cleared {deleted} rating suppression(s) from "
+                "the old show-key format",
+                xbmc.LOGINFO,
+            )
+        conn.execute("PRAGMA user_version = 1")
 
     def _drop_expired_pending_scrobbles_locked(
         self,
@@ -380,6 +411,14 @@ class Cache:
                 "DELETE FROM pending_scrobbles WHERE id = ?",
                 (scrobble_id,),
             )
+
+    def pending_scrobble_exists(self, scrobble_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM pending_scrobbles WHERE id = ?",
+                (scrobble_id,),
+            ).fetchone()
+        return row is not None
 
     def mark_pending_scrobble_attempt(self, scrobble_id: int, error: str) -> None:
         with self._connect() as conn:
@@ -614,6 +653,22 @@ class Cache:
                 WHERE singleton = 1
                 """,
                 (int(time.time() * 1000), summary[:300]),
+            )
+
+    def clear_pull_sync_checkpoint(self) -> None:
+        """Force the next automatic pull to run without a `since` filter.
+
+        Failure counters are deliberately preserved: clearing the timestamp
+        changes what the next run fetches, while the held-run policy still
+        decides when a persistently bad item may stop blocking progress.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE runtime_status
+                SET last_pull_sync_at = NULL
+                WHERE singleton = 1
+                """
             )
 
     def record_pull_sync_held(self, failed_items: set[str]) -> int:

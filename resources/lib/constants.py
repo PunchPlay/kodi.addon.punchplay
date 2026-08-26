@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 
+import xbmc
 import xbmcaddon
 import xbmcvfs
 
@@ -160,6 +161,10 @@ def kodi_datetime_to_utc_iso(value: str | None) -> str | None:
         epoch = time.mktime(parsed)  # interprets the struct as local time
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
     except (ValueError, OverflowError):
+        xbmc.log(
+            f"[PunchPlay] Unparsable lastplayed value {value!r} — omitting watched_at",
+            xbmc.LOGWARNING,
+        )
         return None
 
 
@@ -170,6 +175,10 @@ def kodi_datetime_to_epoch(value: str | None) -> float | None:
     try:
         return time.mktime(time.strptime(value.strip(), "%Y-%m-%d %H:%M:%S"))
     except (ValueError, OverflowError):
+        xbmc.log(
+            f"[PunchPlay] Unparsable Kodi datetime value {value!r}",
+            xbmc.LOGWARNING,
+        )
         return None
 
 
